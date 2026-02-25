@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/fs_context.h>
 #include <linux/slab.h>
 #include <linux/buffer_head.h>
 #include <linux/statfs.h>
@@ -212,7 +213,7 @@ found:
 /* fill_super                                                            */
 /* ------------------------------------------------------------------ */
 
-static int ufs_fill_super(struct super_block *sb, void *data, int silent)
+static int ufs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct ufs_sb_info *sbi;
 	struct inode *root;
@@ -238,7 +239,7 @@ static int ufs_fill_super(struct super_block *sb, void *data, int silent)
 	/* Parse the on-disk superblock */
 	ret = ufs_parse_superblock(sb, sbi);
 	if (ret) {
-		if (!silent)
+		if (!(fc->sb_flags & SB_SILENT))
 			pr_err("ufs: not a UFS1/UFS2 filesystem\n");
 		goto err_sbi;
 	}
@@ -312,11 +313,19 @@ err_sbi:
 /* VFS registration                                                      */
 /* ------------------------------------------------------------------ */
 
-static struct dentry *ufs_mount(struct file_system_type *fs_type, int flags,
-				const char *dev_name, void *data)
+static int ufs_get_tree(struct fs_context *fc)
 {
-	return mount_bdev(fs_type, flags | SB_RDONLY, dev_name, data,
-			  ufs_fill_super);
+	return get_tree_bdev(fc, ufs_fill_super);
+}
+
+static const struct fs_context_operations ufs_context_ops = {
+	.get_tree	= ufs_get_tree,
+};
+
+static int ufs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &ufs_context_ops;
+	return 0;
 }
 
 static void ufs_kill_sb(struct super_block *sb)
@@ -327,11 +336,11 @@ static void ufs_kill_sb(struct super_block *sb)
 }
 
 struct file_system_type ufs_fs_type = {
-	.owner		= THIS_MODULE,
-	.name		= "ufs2bsd",
-	.mount		= ufs_mount,
-	.kill_sb	= ufs_kill_sb,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.owner			= THIS_MODULE,
+	.name			= "ufs2bsd",
+	.init_fs_context	= ufs_init_fs_context,
+	.kill_sb		= ufs_kill_sb,
+	.fs_flags		= FS_REQUIRES_DEV,
 };
 
 /* ------------------------------------------------------------------ */
