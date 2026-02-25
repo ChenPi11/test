@@ -1,0 +1,15 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.tmp_versions/
+Module.symvers
+modules.order
+.cache.mk
+
+# Userspace test binary
+ufs_reader
