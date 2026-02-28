@@ -13,3 +13,7 @@ modules.order
 
 # Userspace test binary
 ufs_reader
+# Hidden build artifact command files
+.*.cmd
+# CodeQL symlink
+/_codeql_detected_source_root
