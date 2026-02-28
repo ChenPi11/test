@@ -24,7 +24,15 @@ Inspired by the OpenBSD source at [`sys/ufs/`](https://github.com/openbsd/src/tr
 
 ## Architecture
 
-### On-disk format
+### Supported filesystem versions
+
+| Version | Magic | Superblock offset | Inode size | Block pointers |
+|---------|-------|-------------------|------------|----------------|
+| FFS1 (UFS1) | `0x011954` | 8192 | 128 bytes | 32-bit |
+| FFS2 (UFS2) | `0x19540119` | 65536 | 256 bytes | 64-bit |
+
+Both are read-only.  FFS2 is the default format used by OpenBSD since 3.6 and
+modern FreeBSD/NetBSD.
 
 The driver implements the BSD Fast File System (FFS) on-disk layout:
 
@@ -96,14 +104,18 @@ The output is `linux_ufs.ko`.
 ### 1. Validate image structure (no root required)
 
 ```bash
-# Create a test UFS1 image
-python3 create_ufs1.py /tmp/test.ufs
+# Create test images
+python3 create_ufs1.py /tmp/test.ufs    # FFS1/UFS1
+python3 create_ufs2.py /tmp/test.ufs2  # FFS2/UFS2
 
 # Build the userspace reader
 gcc -O2 -o /tmp/ufs_reader ufs_reader.c
 
-# Run validation – no root, no kernel module needed
+# Validate FFS1 image
 /tmp/ufs_reader /tmp/test.ufs
+
+# Validate FFS2 image
+/tmp/ufs_reader /tmp/test.ufs2
 ```
 
 Expected output includes:
@@ -135,24 +147,24 @@ sudo insmod linux_ufs.ko
 # Verify registration
 cat /proc/filesystems | grep ufs2bsd
 
-# Create a test image
+# --- FFS1 ---
 python3 create_ufs1.py /tmp/test.ufs
-
-# Set up a loop device
 sudo losetup /dev/loop0 /tmp/test.ufs
-
-# Mount read-only
 sudo mkdir -p /mnt/ufstest
 sudo mount -t ufs2bsd -o ro /dev/loop0 /mnt/ufstest
-
-# Browse the filesystem
 ls -la /mnt/ufstest/
 cat /mnt/ufstest/hello.txt
 df -h /mnt/ufstest
+sudo umount /mnt/ufstest && sudo losetup -d /dev/loop0
 
-# Unmount and clean up
-sudo umount /mnt/ufstest
-sudo losetup -d /dev/loop0
+# --- FFS2 ---
+python3 create_ufs2.py /tmp/test.ufs2
+sudo losetup /dev/loop0 /tmp/test.ufs2
+sudo mount -t ufs2bsd -o ro /dev/loop0 /mnt/ufstest
+ls -la /mnt/ufstest/
+cat /mnt/ufstest/hello.txt
+sudo umount /mnt/ufstest && sudo losetup -d /dev/loop0
+
 sudo rmmod linux_ufs
 ```
 
@@ -203,16 +215,24 @@ The driver is intentionally **read-only** (`SB_RDONLY`). Write support requires
 implementing fragment allocation, inode updates, journal replay (for soft
 updates), and is left as a future exercise.
 
-### Direct + single indirect blocks
+### Direct + indirect block mapping
 
-`ufs_block_map()` handles the first 12 direct block pointers (`di_db[0..11]`)
-and one level of indirection (`di_ib[0]`).  This supports files up to:
+`ufs_block_map()` handles all four levels of block indirection, mirroring
+OpenBSD `ffs_indirtrunc()`:
 
 ```
-12 × fs_bsize + (fs_bsize/4) × fs_bsize  (UFS1, 32-bit pointers)
+Level        Blocks supported         Formula
+-----        ----------------         -------
+Direct       di_db[0..11]             iblock < 12
+Single ind.  di_ib[0]                 +nindir
+Double ind.  di_ib[1]                 +nindir²
+Triple ind.  di_ib[2]                 +nindir³
 ```
 
-For `fs_bsize = 8192`: max ≈ 8 MB + 16 GB ≈ 16 GB.
+For `fs_bsize = 8192` with UFS2 (64-bit, `nindir = 1024`):
+```
+max file size ≈ 12×8KB + 1024×8KB + 1024²×8KB + 1024³×8KB ≈ 8 TiB
+```
 
 ### Inline symlinks
 

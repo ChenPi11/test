@@ -22,67 +22,117 @@
 /* ------------------------------------------------------------------ */
 
 /*
+ * Read one block pointer from the indirect block at block number @blkno,
+ * at index @idx within that block.
+ *
+ * UFS1 uses 32-bit pointers; UFS2 uses 64-bit pointers.
+ * Returns the fragment address stored there, or 0 for a hole/error.
+ *
+ * This helper mirrors the inner loop of OpenBSD's ffs_indirtrunc().
+ */
+static u64 ufs_read_indir(struct super_block *sb, u64 blkno, u64 idx, int ufs2)
+{
+	struct buffer_head *bh;
+	u64 result = 0;
+
+	bh = sb_bread(sb, blkno);
+	if (!bh)
+		return 0;
+
+	if (ufs2) {
+		__le64 *ptrs = (__le64 *)bh->b_data;
+		result = le64_to_cpu(ptrs[idx]);
+	} else {
+		__le32 *ptrs = (__le32 *)bh->b_data;
+		result = le32_to_cpu(ptrs[idx]);
+	}
+	brelse(bh);
+	return result;
+}
+
+/*
  * Map logical block number @iblock (in units of sb->s_blocksize = fs_bsize)
  * to the physical block number on disk (also in units of fs_bsize).
  *
  * UFS stores block pointers as fragment addresses; divide by fs_frag to get
- * the Linux block number.
+ * the Linux block number.  Returns 0 for a hole / unmapped block.
  *
- * Returns the block number, or 0 if the block is a hole / unmapped.
- *
- * Supports direct blocks and a single level of indirection.
+ * Mirrors the three indirection levels (SINGLE/DOUBLE/TRIPLE) described in
+ * OpenBSD sys/ufs/ffs/ffs_inode.c.  Both UFS1 (32-bit pointers) and UFS2
+ * (64-bit pointers) are handled via the ufs_read_indir() helper.
  */
 u64 ufs_block_map(struct inode *inode, sector_t iblock)
 {
 	struct ufs_sb_info   *sbi = UFS_SB(inode->i_sb);
 	struct ufs_inode_info *ui = UFS_I(inode);
-	u64 frag_addr;
+	int   ufs2   = sbi->fs_ufs2;
+	u64   frag   = sbi->fs_frag;
+	u64   nindir = sbi->fs_nindir;
+	u64   frag_addr;
 
+	/* ---- Direct blocks (di_db[0..11]) ---- */
 	if (iblock < UFS_NDADDR) {
-		/* Direct block: di_db[i] is a fragment address */
-		if (sbi->fs_ufs2)
-			frag_addr = le64_to_cpu(ui->i_u.i2.db[iblock]);
-		else
-			frag_addr = le32_to_cpu(ui->i_u.i1.db[iblock]);
-		if (!frag_addr)
-			return 0;
-		/* Convert fragment address → block number */
-		return frag_addr / sbi->fs_frag;
+		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.db[iblock])
+				 : le32_to_cpu(ui->i_u.i1.db[iblock]);
+		return frag_addr ? frag_addr / frag : 0;
 	}
+	iblock -= UFS_NDADDR;
 
-	/* Single indirect: block index within the indirect block */
-	{
-		sector_t ind_off = iblock - UFS_NDADDR;
-		u64 ind_frag;
-		struct buffer_head *bh;
-
-		if (ind_off >= sbi->fs_nindir)
-			return 0;	/* beyond single-indirect range */
-
-		if (sbi->fs_ufs2)
-			ind_frag = le64_to_cpu(ui->i_u.i2.ib[0]);
-		else
-			ind_frag = le32_to_cpu(ui->i_u.i1.ib[0]);
-
-		if (!ind_frag)
-			return 0;	/* hole */
-
-		/* Read the indirect block (using its block number) */
-		bh = sb_bread(inode->i_sb, ind_frag / sbi->fs_frag);
-		if (!bh)
-			return 0;
-
-		if (sbi->fs_ufs2) {
-			__le64 *ptrs = (__le64 *)bh->b_data;
-			frag_addr = le64_to_cpu(ptrs[ind_off]);
-		} else {
-			__le32 *ptrs = (__le32 *)bh->b_data;
-			frag_addr = le32_to_cpu(ptrs[ind_off]);
-		}
-		brelse(bh);
+	/* ---- Single-indirect (di_ib[0]) ---- */
+	if (iblock < nindir) {
+		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.ib[0])
+				 : le32_to_cpu(ui->i_u.i1.ib[0]);
 		if (!frag_addr)
 			return 0;
-		return frag_addr / sbi->fs_frag;
+		frag_addr = ufs_read_indir(inode->i_sb,
+					   frag_addr / frag, iblock, ufs2);
+		return frag_addr ? frag_addr / frag : 0;
+	}
+	iblock -= nindir;
+
+	/* ---- Double-indirect (di_ib[1]) ---- */
+	if (iblock < nindir * nindir) {
+		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.ib[1])
+				 : le32_to_cpu(ui->i_u.i1.ib[1]);
+		if (!frag_addr)
+			return 0;
+		/* Level 1: index into the double-indirect block */
+		frag_addr = ufs_read_indir(inode->i_sb,
+					   frag_addr / frag,
+					   iblock / nindir, ufs2);
+		if (!frag_addr)
+			return 0;
+		/* Level 2: index into the single-indirect block */
+		frag_addr = ufs_read_indir(inode->i_sb,
+					   frag_addr / frag,
+					   iblock % nindir, ufs2);
+		return frag_addr ? frag_addr / frag : 0;
+	}
+	iblock -= nindir * nindir;
+
+	/* ---- Triple-indirect (di_ib[2]) ---- */
+	{
+		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.ib[2])
+				 : le32_to_cpu(ui->i_u.i1.ib[2]);
+		if (!frag_addr)
+			return 0;
+		/* Level 1 */
+		frag_addr = ufs_read_indir(inode->i_sb,
+					   frag_addr / frag,
+					   iblock / (nindir * nindir), ufs2);
+		if (!frag_addr)
+			return 0;
+		/* Level 2 */
+		frag_addr = ufs_read_indir(inode->i_sb,
+					   frag_addr / frag,
+					   (iblock / nindir) % nindir, ufs2);
+		if (!frag_addr)
+			return 0;
+		/* Level 3 */
+		frag_addr = ufs_read_indir(inode->i_sb,
+					   frag_addr / frag,
+					   iblock % nindir, ufs2);
+		return frag_addr ? frag_addr / frag : 0;
 	}
 }
 
@@ -164,9 +214,16 @@ static const char *ufs_get_link(struct dentry *dentry, struct inode *inode,
 
 	maxlen = sbi->fs_ufs2 ? UFS2_MAXSYMLINKLEN : UFS1_MAXSYMLINKLEN;
 
-	/* Short symlinks stored inline */
+	/* Short symlinks stored inline in the inode's block-pointer area */
 	if (inode->i_size <= maxlen) {
-		return (const char *)ui->i_u.i1.db;
+		/*
+		 * UFS1: di_db[] is __le32[15]; cast to char *.
+		 * UFS2: di_db[] is __le64[15]; cast to char *.
+		 * The union members are laid out identically in memory;
+		 * we just need the right pointer width for the type check.
+		 */
+		return sbi->fs_ufs2 ? (const char *)ui->i_u.i2.db
+				    : (const char *)ui->i_u.i1.db;
 	}
 
 	/* Long symlink: read from data pages */
@@ -278,9 +335,22 @@ static void ufs_set_inode_ops(struct inode *inode)
 		inode->i_data.a_ops = &ufs_aops;
 		break;
 	default:
-		init_special_inode(inode, inode->i_mode,
-				   (dev_t)le32_to_cpu(
-					UFS_I(inode)->i_u.i1.db[0]));
+		{
+			struct ufs_sb_info *sbi = UFS_SB(inode->i_sb);
+			dev_t rdev;
+
+			/*
+			 * Block/char device number is stored in di_db[0].
+			 * UFS1: 32-bit pointer; UFS2: 64-bit pointer.
+			 */
+			if (sbi->fs_ufs2)
+				rdev = (dev_t)le64_to_cpu(
+						UFS_I(inode)->i_u.i2.db[0]);
+			else
+				rdev = (dev_t)le32_to_cpu(
+						UFS_I(inode)->i_u.i1.db[0]);
+			init_special_inode(inode, inode->i_mode, rdev);
+		}
 		break;
 	}
 }

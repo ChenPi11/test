@@ -285,12 +285,139 @@ static void list_dir1(ufs_sb_t *sb, ufs1_dinode_t *din)
 	free(blk_buf);
 }
 
+/* ---- UFS2 helpers ---- */
+
+/* Read inode @ino into @din (UFS2) */
+static int read_inode2(ufs_sb_t *sb, uint32_t ino, ufs2_dinode_t *din)
+{
+	uint64_t fsba    = ino_to_fsba(sb, ino);
+	uint32_t fsbo    = (ino % sb->ipg) % sb->inopb;
+	uint64_t blk_num = fsba / sb->frag;
+	off_t    blk_off = (off_t)blk_num * sb->bsize;
+	off_t    ioff    = blk_off + (off_t)fsbo * sizeof(*din);
+
+	return read_at(ioff, din, sizeof(*din));
+}
+
+/* Read one indirect block pointer (UFS2 uses 64-bit pointers) */
+static uint64_t read_indir2(ufs_sb_t *sb, uint64_t blk_num, uint64_t idx)
+{
+	uint8_t *buf = malloc(sb->bsize);
+	uint64_t result = 0;
+	if (!buf) return 0;
+	if (read_at((off_t)blk_num * sb->bsize, buf, sb->bsize) == 0) {
+		int64_t raw;
+		memcpy(&raw, buf + idx * 8, 8);
+		result = (uint64_t)raw;
+	}
+	free(buf);
+	return result;
+}
+
+/* Map logical block @iblk (UFS2) to fragment address (0 = hole) */
+static uint64_t ufs2_block_map(ufs_sb_t *sb, ufs2_dinode_t *din, uint64_t iblk)
+{
+	uint64_t nindir = sb->nindir;
+	uint64_t fa;
+
+	if (iblk < UFS_NDADDR)
+		return (uint64_t)din->di_db[iblk];
+	iblk -= UFS_NDADDR;
+
+	/* Single indirect */
+	if (iblk < nindir) {
+		fa = (uint64_t)din->di_ib[0];
+		if (!fa) return 0;
+		return read_indir2(sb, fa / sb->frag, iblk);
+	}
+	iblk -= nindir;
+
+	/* Double indirect */
+	if (iblk < nindir * nindir) {
+		fa = (uint64_t)din->di_ib[1];
+		if (!fa) return 0;
+		fa = read_indir2(sb, fa / sb->frag, iblk / nindir);
+		if (!fa) return 0;
+		return read_indir2(sb, fa / sb->frag, iblk % nindir);
+	}
+	iblk -= nindir * nindir;
+
+	/* Triple indirect */
+	fa = (uint64_t)din->di_ib[2];
+	if (!fa) return 0;
+	fa = read_indir2(sb, fa / sb->frag, iblk / (nindir * nindir));
+	if (!fa) return 0;
+	fa = read_indir2(sb, fa / sb->frag, (iblk / nindir) % nindir);
+	if (!fa) return 0;
+	return read_indir2(sb, fa / sb->frag, iblk % nindir);
+}
+
+/* Read bytes of a UFS2 regular file */
+static int read_file2(ufs_sb_t *sb, ufs2_dinode_t *din, uint8_t *out,
+		      uint64_t size)
+{
+	uint64_t done = 0, iblk = 0;
+
+	while (done < size) {
+		uint64_t frag_addr = ufs2_block_map(sb, din, iblk);
+		uint64_t copy = size - done;
+		if (copy > sb->bsize) copy = sb->bsize;
+		if (!frag_addr) {
+			memset(out + done, 0, copy);
+		} else {
+			off_t off = (off_t)(frag_addr / sb->frag) * sb->bsize;
+			if (read_at(off, out + done, copy) != 0) return -1;
+		}
+		done += copy;
+		iblk++;
+	}
+	return 0;
+}
+
+/* List directory entries from a UFS2 dir inode */
+static void list_dir2(ufs_sb_t *sb, ufs2_dinode_t *din)
+{
+	uint64_t dir_size = din->di_size;
+	uint64_t pos = 0, iblk = 0;
+	uint8_t *blk_buf = malloc(sb->bsize);
+	if (!blk_buf) return;
+
+	while (pos < dir_size) {
+		uint64_t frag_addr = ufs2_block_map(sb, din, iblk);
+		off_t blk_off;
+		uint8_t *p, *end;
+
+		if (!frag_addr) { pos += sb->bsize; iblk++; continue; }
+		blk_off = (off_t)(frag_addr / sb->frag) * sb->bsize;
+		if (read_at(blk_off, blk_buf, sb->bsize) != 0) break;
+
+		p   = blk_buf;
+		end = blk_buf + sb->bsize;
+		while (p < end) {
+			ufs_direct_t *de = (ufs_direct_t *)p;
+			uint32_t ino    = de->d_ino;
+			uint16_t reclen = de->d_reclen;
+			if (reclen < 8 || reclen > (uint16_t)(end - p)) break;
+			if (ino != 0) {
+				char name[256];
+				memcpy(name, de->d_name, de->d_namlen);
+				name[de->d_namlen] = '\0';
+				printf("  ino=%-4u type=%u name=%s\n",
+				       ino, de->d_type, name);
+			}
+			p   += reclen;
+			pos += reclen;
+		}
+		iblk++;
+		if (pos % sb->bsize) pos += sb->bsize - (pos % sb->bsize);
+	}
+	free(blk_buf);
+}
+
 /* ---- Main ---- */
 int main(int argc, char **argv)
 {
 	ufs_sb_t   sb;
-	ufs1_dinode_t root_ino;
-	ufs1_dinode_t file_ino;
 	uint8_t   *filebuf;
 
 	if (argc < 2) {
@@ -307,8 +434,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("\n=== UFS Superblock ===\n");
-	printf("  Version  : UFS%s\n", sb.ufs2 ? "2" : "1");
+	printf("\n=== UFS%s (FFS%s) Superblock ===\n",
+	       sb.ufs2 ? "2" : "1", sb.ufs2 ? "2" : "1");
 	printf("  Magic    : 0x%08x\n", sb.magic);
 	printf("  Volume   : %s\n", sb.volname[0] ? sb.volname : "(unnamed)");
 	printf("  bsize    : %u\n", sb.bsize);
@@ -321,40 +448,78 @@ int main(int argc, char **argv)
 	printf("  iblkno   : %u\n", sb.iblkno);
 	printf("  nindir   : %u\n", sb.nindir);
 
-	if (sb.ufs2) { printf("UFS2 reading not implemented in this test.\n"); close(fd_img); return 0; }
+	if (sb.ufs2) {
+		/* ---- UFS2 / FFS2 path ---- */
+		ufs2_dinode_t root_ino, file_ino;
 
-	/* ---- Root inode (ino 2) ---- */
-	printf("\n=== Root Inode (ino %u) ===\n", UFS_ROOTINO);
-	if (read_inode1(&sb, UFS_ROOTINO, &root_ino) != 0) {
-		fprintf(stderr, "ERROR: cannot read root inode\n"); return 1;
+		printf("\n=== Root Inode (ino %u) [UFS2] ===\n", UFS_ROOTINO);
+		if (read_inode2(&sb, UFS_ROOTINO, &root_ino) != 0) {
+			fprintf(stderr, "ERROR: cannot read root inode\n");
+			return 1;
+		}
+		printf("  mode      : 0%o\n",  root_ino.di_mode);
+		printf("  nlink     : %d\n",   root_ino.di_nlink);
+		printf("  size      : %llu\n", (unsigned long long)root_ino.di_size);
+		printf("  di_db[0]  : %lld (frag addr)\n", (long long)root_ino.di_db[0]);
+
+		printf("\n=== Root Directory Contents [UFS2] ===\n");
+		list_dir2(&sb, &root_ino);
+
+		printf("\n=== File Inode 3 (hello.txt) [UFS2] ===\n");
+		if (read_inode2(&sb, 3, &file_ino) != 0) {
+			fprintf(stderr, "ERROR: cannot read file inode\n");
+			return 1;
+		}
+		printf("  mode      : 0%o\n",  file_ino.di_mode);
+		printf("  size      : %llu\n", (unsigned long long)file_ino.di_size);
+		printf("  di_db[0]  : %lld (frag addr)\n", (long long)file_ino.di_db[0]);
+
+		filebuf = malloc(file_ino.di_size + 1);
+		if (!filebuf) { fprintf(stderr, "malloc failed\n"); return 1; }
+		if (read_file2(&sb, &file_ino, filebuf, file_ino.di_size) != 0) {
+			fprintf(stderr, "ERROR: cannot read file data\n");
+			free(filebuf); return 1;
+		}
+		filebuf[file_ino.di_size] = '\0';
+		printf("\n=== File Contents ===\n%s\n", filebuf);
+		free(filebuf);
+
+	} else {
+		/* ---- UFS1 / FFS1 path ---- */
+		ufs1_dinode_t root_ino, file_ino;
+
+		printf("\n=== Root Inode (ino %u) [UFS1] ===\n", UFS_ROOTINO);
+		if (read_inode1(&sb, UFS_ROOTINO, &root_ino) != 0) {
+			fprintf(stderr, "ERROR: cannot read root inode\n");
+			return 1;
+		}
+		printf("  mode   : 0%o\n", root_ino.di_mode);
+		printf("  nlink  : %d\n",  root_ino.di_nlink);
+		printf("  size   : %llu\n", (unsigned long long)root_ino.di_size);
+		printf("  db[0]  : %u (frag addr)\n", root_ino.di_db[0]);
+
+		printf("\n=== Root Directory Contents [UFS1] ===\n");
+		list_dir1(&sb, &root_ino);
+
+		printf("\n=== File Inode 3 (hello.txt) [UFS1] ===\n");
+		if (read_inode1(&sb, 3, &file_ino) != 0) {
+			fprintf(stderr, "ERROR: cannot read file inode\n");
+			return 1;
+		}
+		printf("  mode   : 0%o\n", file_ino.di_mode);
+		printf("  size   : %llu\n", (unsigned long long)file_ino.di_size);
+		printf("  db[0]  : %u (frag addr)\n", file_ino.di_db[0]);
+
+		filebuf = malloc(file_ino.di_size + 1);
+		if (!filebuf) { fprintf(stderr, "malloc failed\n"); return 1; }
+		if (read_file1(&sb, &file_ino, filebuf, file_ino.di_size) != 0) {
+			fprintf(stderr, "ERROR: cannot read file data\n");
+			free(filebuf); return 1;
+		}
+		filebuf[file_ino.di_size] = '\0';
+		printf("\n=== File Contents ===\n%s\n", filebuf);
+		free(filebuf);
 	}
-	printf("  mode   : 0%o\n", root_ino.di_mode);
-	printf("  nlink  : %d\n",  root_ino.di_nlink);
-	printf("  size   : %llu\n", (unsigned long long)root_ino.di_size);
-	printf("  db[0]  : %u (frag addr)\n", root_ino.di_db[0]);
-
-	/* ---- Root directory listing ---- */
-	printf("\n=== Root Directory Contents ===\n");
-	list_dir1(&sb, &root_ino);
-
-	/* ---- Read inode 3 (hello.txt) ---- */
-	printf("\n=== File Inode 3 (hello.txt) ===\n");
-	if (read_inode1(&sb, 3, &file_ino) != 0) {
-		fprintf(stderr, "ERROR: cannot read file inode\n"); return 1;
-	}
-	printf("  mode   : 0%o\n", file_ino.di_mode);
-	printf("  size   : %llu\n", (unsigned long long)file_ino.di_size);
-	printf("  db[0]  : %u (frag addr)\n", file_ino.di_db[0]);
-
-	filebuf = malloc(file_ino.di_size + 1);
-	if (!filebuf) { fprintf(stderr, "malloc failed\n"); return 1; }
-	if (read_file1(&sb, &file_ino, filebuf, file_ino.di_size) != 0) {
-		fprintf(stderr, "ERROR: cannot read file data\n"); free(filebuf); return 1;
-	}
-	filebuf[file_ino.di_size] = '\0';
-
-	printf("\n=== File Contents ===\n%s\n", filebuf);
-	free(filebuf);
 
 	close(fd_img);
 	printf("=== All checks PASSED ===\n");
