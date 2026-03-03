@@ -358,9 +358,11 @@ static int __init ufs_init(void)
 {
 	int ret;
 
-	ufs_inode_cachep = kmem_cache_create("ufs_inode_cache",
+	ufs_inode_cachep = kmem_cache_create_usercopy("ufs_inode_cache",
 				sizeof(struct ufs_inode_info), 0,
 				SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
+				offsetof(struct ufs_inode_info, i_u),
+				sizeof_field(struct ufs_inode_info, i_u),
 				ufs_inode_init_once);
 	if (!ufs_inode_cachep)
 		return -ENOMEM;
