@@ -191,6 +191,17 @@ static int ufs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	/* Expose BSD flags via stat.attributes */
 	stat->attributes      = ui->i_flags;
 	stat->attributes_mask = ~0U;
+
+	/*
+	 * Expose FFS2 birth time (creation time) via statx(STATX_BTIME).
+	 * FFS1 inodes have no birthtime field; leave it at zero in that case.
+	 */
+	if (UFS_SB(inode->i_sb)->fs_ufs2) {
+		stat->btime.tv_sec  = ui->i_birthtime;
+		stat->btime.tv_nsec = ui->i_birthtime_nsec;
+		stat->result_mask  |= STATX_BTIME;
+	}
+
 	return 0;
 }
 
@@ -242,6 +253,11 @@ const struct file_operations ufs_file_operations = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= generic_file_read_iter,
 	.mmap		= generic_file_mmap,
+	/*
+	 * .lock and .flock are intentionally omitted.  When these are NULL
+	 * the VFS falls through to posix_lock_file() in vfs_lock_file(),
+	 * giving standard POSIX record-lock and flock(2) behaviour for free.
+	 */
 };
 
 const struct inode_operations ufs_symlink_inode_ops = {
@@ -309,6 +325,10 @@ static void ufs2_fill_inode(struct inode *inode, struct ufs2_dinode *din)
 	inode->i_blocks    = le64_to_cpu(din->di_blocks) >> 9; /* bytes -> 512-B */
 	inode->i_generation = le32_to_cpu(din->di_gen);
 	ui->i_flags = le32_to_cpu(din->di_flags);
+
+	/* FFS2 birth time (creation time) – stored for STATX_BTIME */
+	ui->i_birthtime      = le64_to_cpu(din->di_birthtime);
+	ui->i_birthtime_nsec = le32_to_cpu(din->di_birthnsec);
 
 	memcpy(ui->i_u.i2.db, din->di_db, sizeof(din->di_db));
 	memcpy(ui->i_u.i2.ib, din->di_ib, sizeof(din->di_ib));

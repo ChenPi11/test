@@ -19,6 +19,9 @@
 #define UFS_MAGIC	0x011954	/* UFS1 (FFS) magic number */
 #define UFS2_MAGIC	0x19540119	/* UFS2 magic number */
 
+/* ---- fs_flags bits (fs_flags field in superblock at offset 1308) ---- */
+#define FS_UNCLEAN	0x0001		/* filesystem not cleanly unmounted */
+
 /* ---- Superblock byte offsets on disk ---- */
 #define UFS_SBLOCK_UFS1		8192
 #define UFS_SBLOCK_UFS2		65536

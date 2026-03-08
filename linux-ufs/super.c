@@ -205,6 +205,23 @@ found:
 	memcpy(sbi->fs_volname, fsb->fs_volname, sizeof(sbi->fs_volname) - 1);
 	sbi->fs_volname[sizeof(sbi->fs_volname) - 1] = '\0';
 
+	/*
+	 * Warn if the filesystem was not cleanly unmounted.
+	 * fs_clean == 0 means dirty; FS_UNCLEAN in fs_flags is a belt-and-
+	 * suspenders second flag written by some BSD versions.
+	 *
+	 * Since this is a read-only driver we still mount the filesystem, but
+	 * the operator should run fsck_ffs(8) on the source device before
+	 * trusting the data.  Mirrors the warning emitted by OpenBSD
+	 * ffs_mountfs() when MNT_FORCE is used on an unclean image.
+	 */
+	if (fsb->fs_clean == 0 ||
+	    (le32_to_cpu(fsb->fs_flags) & FS_UNCLEAN)) {
+		pr_warn("ufs: %s: filesystem not cleanly unmounted; "
+			"data may be inconsistent (run fsck_ffs)\n",
+			sb->s_id);
+	}
+
 	kfree(fsb);
 	return 0;
 }

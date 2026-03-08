@@ -59,6 +59,9 @@ struct ufs_inode_info {
 		} i2;
 	} i_u;
 	u32	i_flags;		/* BSD file flags */
+	/* FFS2 birth time (creation time); zero for FFS1 */
+	s64	i_birthtime;		/* seconds since epoch */
+	u32	i_birthtime_nsec;	/* nanosecond fraction */
 	struct inode vfs_inode;		/* must be last */
 };
 
