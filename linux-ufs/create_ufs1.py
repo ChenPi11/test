@@ -35,6 +35,7 @@ import struct
 import math
 import os
 import sys
+import time
 
 # ──────────────────────────────────────────────────────────────
 # Constants matching ufs_fs.h
@@ -81,6 +82,7 @@ def write_at(buf, offset, data):
 # The struct layout is validated in ufs_fs.h comments.
 def build_superblock():
     sb = bytearray(1376)
+    now = int(time.time())
 
     def w32(off, val):
         struct.pack_into('<I', sb, off, val & 0xFFFFFFFF)
@@ -96,6 +98,7 @@ def build_superblock():
     w32(16,  IBLKNO_FRAG)          # fs_iblkno (frag addr of inode table in CG)
     w32(24,  0)                    # fs_cgoffset  (UFS1: CG layout offset)
     w32(28,  0xFFFFFFFF)           # fs_cgmask    (UFS1: CG layout mask)
+    w32(32,  now & 0xFFFFFFFF)     # fs_ffs1_time (last write time)
     w32s(36, FPG * NCG)            # fs_ffs1_size (total frags)
     w32(44,  NCG)                  # fs_ncg
     w32(48,  BSIZE)                # fs_bsize
@@ -122,6 +125,11 @@ def build_superblock():
     # Volume name at offset 680
     volname = b'TestVol\x00'
     sb[680:680 + len(volname)] = volname
+
+    # FFS1 superblock checksum: fs_state = FS_OKAY - fs_ffs1_time (32-bit).
+    # At mount time the kernel verifies: (fs_state + fs_ffs1_time) == FS_OKAY.
+    FS_OKAY = 0x7c269d38
+    w32(1352, (FS_OKAY - (now & 0xFFFFFFFF)) & 0xFFFFFFFF)  # fs_state
 
     # UFS1 magic at offset 1372
     w32(1372, UFS_MAGIC)

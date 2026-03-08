@@ -206,20 +206,55 @@ found:
 	sbi->fs_volname[sizeof(sbi->fs_volname) - 1] = '\0';
 
 	/*
-	 * Warn if the filesystem was not cleanly unmounted.
-	 * fs_clean == 0 means dirty; FS_UNCLEAN in fs_flags is a belt-and-
-	 * suspenders second flag written by some BSD versions.
+	 * Verify filesystem clean status.
 	 *
-	 * Since this is a read-only driver we still mount the filesystem, but
-	 * the operator should run fsck_ffs(8) on the source device before
-	 * trusting the data.  Mirrors the warning emitted by OpenBSD
-	 * ffs_mountfs() when MNT_FORCE is used on an unclean image.
+	 * FFS1 uses a superblock checksum (fs_state) to guard the validity
+	 * of fs_clean.  At clean-unmount time, newfs/fsck write:
+	 *   fs_state = FS_OKAY - fs_ffs1_time   (unsigned 32-bit arithmetic)
+	 * At mount time we verify:
+	 *   (fs_state + fs_ffs1_time) == FS_OKAY
+	 * If the equation holds, fs_clean is trustworthy; otherwise the
+	 * superblock may be partially written or from a foreign tool that
+	 * did not maintain this invariant.
+	 *
+	 * FFS2 does not use fs_state as a checksum; trust fs_clean and
+	 * FS_UNCLEAN directly.
+	 *
+	 * Since this is a read-only driver we always mount the filesystem
+	 * regardless of clean status, but warn the operator to run
+	 * fsck_ffs(8) on any questionable image.  This mirrors the warning
+	 * emitted by OpenBSD ffs_mountfs() when MNT_FORCE is used.
 	 */
-	if (fsb->fs_clean == 0 ||
-	    (le32_to_cpu(fsb->fs_flags) & FS_UNCLEAN)) {
-		pr_warn("ufs: %s: filesystem not cleanly unmounted; "
-			"data may be inconsistent (run fsck_ffs)\n",
-			sb->s_id);
+	if (!sbi->fs_ufs2) {
+		/* FFS1: validate superblock checksum before trusting fs_clean */
+		u32 ffs1_time  = le32_to_cpu(fsb->fs_ffs1_time);
+		u32 ffs1_state = le32_to_cpu(fsb->fs_state);
+
+		if ((ffs1_state + ffs1_time) != FS_OKAY) {
+			pr_warn("ufs: %s: FFS1 superblock checksum invalid "
+				"(fs_state=0x%08x + fs_time=0x%08x = 0x%08x, "
+				"expected FS_OKAY=0x%08x); "
+				"filesystem clean-state unverifiable\n",
+				sb->s_id, ffs1_state, ffs1_time,
+				ffs1_state + ffs1_time, (u32)FS_OKAY);
+		} else if (fsb->fs_clean == 0 ||
+			   (le32_to_cpu(fsb->fs_flags) & FS_UNCLEAN)) {
+			pr_warn("ufs: %s: filesystem not cleanly unmounted "
+				"(fs_clean=0x%02x); "
+				"data may be inconsistent (run fsck_ffs)\n",
+				sb->s_id, fsb->fs_clean);
+		}
+	} else {
+		/*
+		 * FFS2: fs_state is not used as a checksum guard.
+		 * Trust fs_clean and the FS_UNCLEAN flag directly.
+		 */
+		if (fsb->fs_clean == 0 ||
+		    (le32_to_cpu(fsb->fs_flags) & FS_UNCLEAN)) {
+			pr_warn("ufs: %s: filesystem not cleanly unmounted; "
+				"data may be inconsistent (run fsck_ffs)\n",
+				sb->s_id);
+		}
 	}
 
 	kfree(fsb);

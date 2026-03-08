@@ -22,6 +22,20 @@
 /* ---- fs_flags bits (fs_flags field in superblock at offset 1308) ---- */
 #define FS_UNCLEAN	0x0001		/* filesystem not cleanly unmounted */
 
+/*
+ * FFS1 superblock checksum constant.
+ * At clean-unmount time: fs_state = FS_OKAY - fs_ffs1_time  (unsigned 32-bit).
+ * At mount time:         (fs_state + fs_ffs1_time) == FS_OKAY  → fs_clean valid.
+ * If the equation does not hold, fs_clean cannot be trusted.
+ * Defined in OpenBSD sys/ufs/ffs/fs.h as FS_OKAY.
+ * FFS2 does not use fs_state as a checksum guard.
+ */
+#define FS_OKAY		0x7c269d38	/* FFS1 superblock checksum constant */
+
+/* ---- fs_clean flag values ---- */
+#define FS_ISCLEAN	0x01		/* filesystem is clean */
+#define FS_WASCLEAN	0x02		/* filesystem was clean at last mount */
+
 /* ---- Superblock byte offsets on disk ---- */
 #define UFS_SBLOCK_UFS1		8192
 #define UFS_SBLOCK_UFS2		65536

@@ -64,28 +64,34 @@ Stability-risk scale: **Low** · **Medium** · **High** (kernel-level risks only
 ## 4. Superblock
 
 ### 4-A  `fs_clean` / `FS_UNCLEAN` warning at mount
+> **✅ IMPLEMENTED** – `ufs_parse_superblock()` in `super.c` emits `pr_warn()` whenever `fs_clean == 0` or `fs_flags & FS_UNCLEAN` is set (FFS1 path: only after the `fs_state` checksum passes; FFS2 path: direct check).
+
 | Dimension | Assessment |
 |-----------|-----------|
-| **Code impact** | 5-line addition in `ufs_fill_super()` after superblock is loaded: check `fs->fs_clean == 0` or `fs->fs_flags & FS_UNCLEAN`, emit `pr_warn()`, optionally refuse the mount. Zero architectural change. |
-| **Stability risk** | **Low** – read-only check; no new I/O or allocations. If over-zealously turned into a hard error it could prevent mounting a recoverable image, but a `pr_warn` is always safe. |
+| **Code impact** | ~8 LoC in `ufs_parse_superblock()`. Zero architectural change. |
+| **Stability risk** | **Low** – read-only check; no new I/O or allocations. |
 | **Effort** | **XS** (~8 LoC) |
-| **Necessary?** | **Strongly recommended.** Mounting a filesystem that was not cleanly unmounted may expose stale/partially-written data. A `pr_warn` is standard practice (see `ext4_fill_super`, `btrfs_read_super_tree`). |
+| **Necessary?** | **Strongly recommended.** ✓ Done. |
 
 ### 4-B  `FS_UNCLEAN` flag in `fs_flags`
+> **✅ IMPLEMENTED** – Covered by 4-A.
+
 | Dimension | Assessment |
 |-----------|-----------|
-| **Code impact** | Covered by 4-A — the same 8-line check should test both `fs_clean == 0` AND `(fs_flags & FS_UNCLEAN)`. |
+| **Code impact** | Included in the same 8-line check as 4-A. |
 | **Stability risk** | **Low** |
 | **Effort** | **XS** (included in 4-A) |
-| **Necessary?** | Same as 4-A. |
+| **Necessary?** | ✓ Done. |
 
 ### 4-C  Superblock checksum (`fs_state` / `FS_OKAY`)
+> **✅ IMPLEMENTED** – FFS1: `ufs_parse_superblock()` verifies `(fs_state + fs_ffs1_time) == FS_OKAY` before trusting `fs_clean`. `FS_OKAY = 0x7c269d38`, `FS_ISCLEAN`, `FS_WASCLEAN` added to `ufs_fs.h`. FFS2 has no `fs_state` guard; direct check used instead. Test images (`create_ufs1.py`, `create_test_image.py`) now write a valid `fs_state` checksum.
+
 | Dimension | Assessment |
 |-----------|-----------|
-| **Code impact** | `fs_state` is an FFS1 field (an XOR of `fs_magic` with a constant). Verifying it is ~15 lines in `ufs_parse_superblock()`. FFS2 does not use `fs_state`; no change needed for FFS2 path. |
+| **Code impact** | ~40 LoC in `super.c` + 3 new constants in `ufs_fs.h` + 2-line fix in each Python test-image generator. |
 | **Stability risk** | **Low** – adds a mount-time guard; no runtime path changes. |
-| **Effort** | **XS** (~15 LoC) |
-| **Necessary?** | **Recommended** for FFS1 images. Prevents silently mounting a corrupted or misidentified block device. |
+| **Effort** | **XS** (~45 LoC total) |
+| **Necessary?** | **Recommended.** ✓ Done. |
 
 ### 4-D  `FS_FLAGS_UPDATED` / `fs_ffs1_flags` compat
 | Dimension | Assessment |

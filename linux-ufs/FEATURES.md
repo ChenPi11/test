@@ -42,7 +42,7 @@ Legend:
 | `di_atime` / `di_atimensec` | ✅ Full | 32-bit (FFS1) and 64-bit (FFS2); nanosecond precision |
 | `di_mtime` / `di_mtimensec` | ✅ Full | Same |
 | `di_ctime` / `di_ctimensec` | ✅ Full | Same |
-| `di_birthtime` / `di_birthnsec` (FFS2) | ❌ Not implemented | Parsed from disk but not surfaced via `statx(STATX_BTIME)` |
+| `di_birthtime` / `di_birthnsec` (FFS2) | ✅ Full | Parsed from disk; surfaced via `statx(STATX_BTIME)`; FFS1 has no birthtime |
 | `di_flags` (BSD `chflags` flags) | ⚠️ Partial | Stored in `ufs_inode_info.i_flags`; exposed via `stat.attributes` in `getattr`, but Linux has no `chflags(2)` syscall – flags are visible but not enforced |
 | `di_extb[2]` / `di_extsize` (FFS2 EA blocks) | ❌ Not implemented | Extended-attribute block pointers present in on-disk struct but never read |
 
@@ -74,9 +74,9 @@ Legend:
 | `statfs` (block/inode counts) | ✅ Full | `f_blocks`, `f_bfree`, `f_files`, `f_ffree` |
 | `show_options` | ✅ Full | `version=ufs1/ufs2`, `volname=…` |
 | Block and fragment size validation | ✅ Full | Power-of-2, `fs_bsize ≥ fs_fsize`, etc. |
-| `fs_clean` / dirty-filesystem detection | ❌ Not implemented | Unclean FFS1/FFS2 images are mounted without any warning; `fs_clean == 0` is not checked |
-| `FS_UNCLEAN` flag in `fs_flags` | ❌ Not implemented | Not read or logged |
-| Superblock checksum (`FS_OKAY`) | ❌ Not implemented | On-disk checksum in `fs_state` is never verified |
+| `fs_clean` / dirty-filesystem detection | ✅ Full | Checked at mount; `pr_warn` emitted if `fs_clean == 0` |
+| `FS_UNCLEAN` flag in `fs_flags` | ✅ Full | Checked alongside `fs_clean`; `pr_warn` on either condition |
+| Superblock checksum (`FS_OKAY`) | ✅ Full | FFS1 only: `(fs_state + fs_ffs1_time) == FS_OKAY` verified; mismatch → "unverifiable" warning; FFS2 has no such checksum |
 | `FS_FLAGS_UPDATED` / `fs_ffs1_flags` compat | ❌ Not implemented | Legacy FFS1 flag area not inspected |
 | `fs_inodefmt` check (`FS_44INODEFMT` vs `FS_42INODEFMT`) | ❌ Not implemented | Old 4.2BSD inode format (no `di_uid`/`di_gid` 32-bit fields) not handled |
 | Backup cylinder-group superblocks | ❌ Not implemented | Only the three primary probe offsets are tried; no fallback to CG backup SBs |
@@ -137,7 +137,7 @@ Legend:
 | `llseek` | ✅ Full | `generic_file_llseek` |
 | `read_dir` (directory) | ✅ Full | `generic_read_dir` |
 | `getattr` / `statx` | ✅ Full | `generic_fillattr`; `stat.blksize = fs_fsize` |
-| `statx` `STATX_BTIME` (birthtime) | ❌ Not implemented | `di_birthtime` in FFS2 is read but not placed in `stat->btime` |
+| `statx` `STATX_BTIME` (birthtime) | ✅ Full | FFS2 `di_birthtime` surfaced via `stat->btime` + `STATX_BTIME` in result_mask |
 | Write / `write_iter` | ❌ Not implemented | Read-only driver |
 | `fsync` / `fdatasync` | ❌ Not implemented | No dirty data to flush |
 | `fallocate` / `punch_hole` | ❌ Not implemented | Write feature |

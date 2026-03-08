@@ -166,6 +166,7 @@ def ffs1_build_superblock(now):
     w32(16,  FFS1_IBLKNO_FRAG)             # fs_iblkno
     w32(24,  0)                             # fs_cgoffset (UFS1 layout offset)
     w32(28,  0xFFFFFFFF)                    # fs_cgmask
+    w32(32,  now & 0xFFFFFFFF)             # fs_ffs1_time (last write time)
     w32s(36, FFS1_FPG * FFS1_NCG)          # fs_ffs1_size (total frags)
     w32(44,  FFS1_NCG)                      # fs_ncg
     w32(48,  FFS1_BSIZE)                    # fs_bsize
@@ -188,6 +189,12 @@ def ffs1_build_superblock(now):
 
     volname = b'TestFFS1\x00'
     sb[680:680 + len(volname)] = volname
+
+    # FFS1 superblock checksum: fs_state = FS_OKAY - fs_ffs1_time (32-bit).
+    # At mount time the kernel verifies: (fs_state + fs_ffs1_time) == FS_OKAY.
+    FS_OKAY = 0x7c269d38
+    w32(1352, (FS_OKAY - (now & 0xFFFFFFFF)) & 0xFFFFFFFF)  # fs_state
+
     w32(1372, UFS1_MAGIC)
     return bytes(sb)
 
