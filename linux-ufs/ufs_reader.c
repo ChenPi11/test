@@ -128,7 +128,20 @@ static off_t frag_to_off(ufs_sb_t *sb, uint64_t frag)
 	return (off_t)(frag * sb->fsize);
 }
 
-/* Read the superblock; returns 0 on success */
+/* Power-of-2 check (same logic as super.c IS_POWER_OF_2) */
+#define IS_POW2(n)  ((n) != 0 && (((n) & ((n)-1)) == 0))
+/* FFS1 superblock checksum constant (OpenBSD FS_OKAY) */
+#define FS_OKAY     0x7c269d38u
+/* fs_flags bit: not cleanly unmounted (matches ufs_fs.h FS_UNCLEAN) */
+#define FS_UNCLEAN  0x0001u
+
+/*
+ * Read the superblock.
+ * Returns  0  on success (sb is filled; warnings may have been printed).
+ *         -1  if no UFS1/UFS2 magic was found.
+ *         -2  if magic was found but the superblock fails sanity checks
+ *             (error message already printed to stderr).
+ */
 static int read_superblock(ufs_sb_t *sb)
 {
 	static const off_t probe[] = { SBLOCK_UFS2, SBLOCK_UFS1, 0 };
@@ -158,7 +171,64 @@ static int read_superblock(ufs_sb_t *sb)
 			sb->magic = magic;
 			memcpy(sb->volname, raw + 680, 32);
 			sb->volname[32] = '\0';
-			printf("Found superblock at offset %lld\n", (long long)probe[i]);
+			printf("Found superblock at offset %lld\n",
+			       (long long)probe[i]);
+
+			/*
+			 * Sanity checks – mirror super.c ufs_fill_super().
+			 * A magic number alone is not sufficient; a partially-
+			 * written or foreign-tool superblock may have garbage
+			 * geometry that would cause undefined behaviour.
+			 */
+			if (!IS_POW2(sb->bsize)   || !IS_POW2(sb->fsize)  ||
+			    sb->bsize < sb->fsize  || sb->bsize < 512       ||
+			    sb->frag  == 0 || sb->ncg   == 0 ||
+			    sb->ipg   == 0 || sb->fpg   == 0 ||
+			    sb->inopb == 0) {
+				fprintf(stderr,
+				    "ERROR: superblock sanity check failed "
+				    "(bsize=%u fsize=%u frag=%u ncg=%u "
+				    "ipg=%u fpg=%u inopb=%u)\n",
+				    sb->bsize, sb->fsize, sb->frag,
+				    sb->ncg, sb->ipg, sb->fpg, sb->inopb);
+				return -2;
+			}
+
+			/*
+			 * FFS1 superblock checksum (warning only).
+			 * Mirrors the check in super.c ufs_parse_superblock().
+			 * At clean-unmount time: fs_state = FS_OKAY - fs_ffs1_time.
+			 * We verify: (fs_state + fs_ffs1_time) == FS_OKAY.
+			 */
+			if (!sb->ufs2) {
+				uint32_t ffs1_time, ffs1_state;
+				memcpy(&ffs1_time,  raw + 32,   4);
+				memcpy(&ffs1_state, raw + 1352, 4);
+				if (ffs1_state + ffs1_time != FS_OKAY)
+					printf("WARN: FFS1 superblock checksum "
+					       "invalid (fs_state=0x%08x + "
+					       "fs_time=0x%08x = 0x%08x, "
+					       "expected 0x%08x)\n",
+					       ffs1_state, ffs1_time,
+					       ffs1_state + ffs1_time,
+					       FS_OKAY);
+			}
+
+			/*
+			 * Clean-status check (warning only).
+			 * Mirrors the check in super.c ufs_parse_superblock().
+			 */
+			{
+				uint8_t  fs_clean = raw[209];
+				uint32_t fs_flags;
+				memcpy(&fs_flags, raw + 1308, 4);
+				if (fs_clean == 0 || (fs_flags & FS_UNCLEAN))
+					printf("WARN: filesystem not cleanly "
+					       "unmounted (fs_clean=%u "
+					       "flags=0x%08x); run fsck_ffs\n",
+					       fs_clean, fs_flags);
+			}
+
 			return 0;
 		}
 	}
@@ -421,17 +491,29 @@ int main(int argc, char **argv)
 	uint8_t   *filebuf;
 
 	if (argc < 2) {
-		fprintf(stderr, "Usage: %s <image-file>\n", argv[0]);
+		fprintf(stderr,
+		    "Usage: %s <image-file> [--superblock-only]\n", argv[0]);
 		return 1;
 	}
+
+	int superblock_only = (argc >= 3 &&
+			       strcmp(argv[2], "--superblock-only") == 0);
 
 	fd_img = open(argv[1], O_RDONLY);
 	if (fd_img < 0) { perror("open"); return 1; }
 
 	/* ---- Superblock ---- */
-	if (read_superblock(&sb) != 0) {
-		fprintf(stderr, "ERROR: not a UFS filesystem\n");
-		return 1;
+	{
+		int sbret = read_superblock(&sb);
+
+		if (sbret != 0) {
+			if (sbret == -1)
+				fprintf(stderr,
+				    "ERROR: not a UFS filesystem\n");
+			/* -2: error already printed by read_superblock */
+			close(fd_img);
+			return 1;
+		}
 	}
 
 	printf("\n=== UFS%s (FFS%s) Superblock ===\n",
@@ -447,6 +529,12 @@ int main(int argc, char **argv)
 	printf("  inopb    : %u\n", sb.inopb);
 	printf("  iblkno   : %u\n", sb.iblkno);
 	printf("  nindir   : %u\n", sb.nindir);
+
+	/* In --superblock-only mode, skip inode/directory/file reading */
+	if (superblock_only) {
+		close(fd_img);
+		return 0;
+	}
 
 	if (sb.ufs2) {
 		/* ---- UFS2 / FFS2 path ---- */
