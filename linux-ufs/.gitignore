@@ -1,0 +1,19 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.tmp_versions/
+Module.symvers
+modules.order
+.cache.mk
+
+# Userspace test binary
+ufs_reader
+# Hidden build artifact command files
+.*.cmd
+# CodeQL symlink
+/_codeql_detected_source_root

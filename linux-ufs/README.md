@@ -1,0 +1,308 @@
+# Linux UFS Driver (`linux_ufs.ko`)
+
+A **read-only** Linux kernel module that mounts **UFS1 and UFS2 (BSD Fast File System)** disk images as created by OpenBSD, FreeBSD, and NetBSD `newfs(8)`.
+
+Inspired by the OpenBSD source at [`sys/ufs/`](https://github.com/openbsd/src/tree/master/sys/ufs).
+
+---
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `ufs_fs.h`       | On-disk format: superblock, UFS1/UFS2 dinodes, directory entries |
+| `ufs.h`          | In-memory structures, helper macros, function prototypes |
+| `super.c`        | `fill_super`, `statfs`, module init/exit |
+| `inode.c`        | Inode reading, block mapping, page cache |
+| `dir.c`          | `readdir` and `lookup` for directories |
+| `file.c`         | Regular file operations (delegates to generic VFS helpers) |
+| `Makefile`       | Out-of-tree kernel module build rules |
+| `create_ufs1.py` | Python script that creates a minimal UFS1 test image |
+| `ufs_reader.c`   | Userspace tool to validate a UFS image without loading the kernel module |
+
+---
+
+## Architecture
+
+### Supported filesystem versions
+
+| Version | Magic | Superblock offset | Inode size | Block pointers |
+|---------|-------|-------------------|------------|----------------|
+| FFS1 (UFS1) | `0x011954` | 8192 | 128 bytes | 32-bit |
+| FFS2 (UFS2) | `0x19540119` | 65536 | 256 bytes | 64-bit |
+
+Both are read-only.  FFS2 is the default format used by OpenBSD since 3.6 and
+modern FreeBSD/NetBSD.
+
+The driver implements the BSD Fast File System (FFS) on-disk layout:
+
+```
+Byte offset   Content
+-----------   -------
+0 – 8191      Boot block (unused)
+8192 –        UFS1 superblock (struct ufs_super_block, 1376 bytes)
+              fs_magic at offset 1372 = 0x011954 (UFS1) or 0x19540119 (UFS2)
+65536 –       UFS2 superblock (alternative location)
+
+Per cylinder group:
+  cgbase  = fpg × cg_number                   (in fragment units)
+  cgstart = cgbase + cgoffset × (cg & ~cgmask) (UFS1), or cgbase (UFS2)
+  cgimin  = cgstart + iblkno                   (inode table start)
+  data blocks follow
+```
+
+### Block-size strategy
+
+BSD VFS imposes no `PAGE_SIZE` constraint on block size because its buffer
+cache tracks block size independently of the VM page size.  OpenBSD's
+`newfs(8)` defaults to `fs_bsize = 16 KiB` regardless of the host's page
+size.
+
+Linux requires `sb->s_blocksize ≤ PAGE_SIZE`.  This driver resolves the
+incompatibility by clamping the VFS I/O block size:
+
+```
+fs_io_bsize = min(fs_bsize, PAGE_SIZE)
+sb->s_blocksize = fs_io_bsize
+```
+
+When `fs_io_bsize < fs_bsize` (large-block images), each FFS block is read as
+`fs_bsize / fs_io_bsize` consecutive VFS I/O blocks.  The block-mapping
+arithmetic in `ufs_block_map()` and `ufs_iget()` accounts for this.
+
+One hard constraint remains: `fs_fsize` (fragment size) must be ≤ `PAGE_SIZE`.
+If `fs_fsize > PAGE_SIZE` the driver rejects the filesystem with `-EINVAL`.
+
+Fragment addresses from inode pointers (`di_db[]`, `di_ib[]`) are converted to
+VFS I/O block numbers:
+
+```
+iofrags      = fs_io_bsize / fs_fsize    (fragments per VFS I/O block)
+io_block_num = fragment_address / iofrags
+```
+
+When `fs_io_bsize == fs_bsize` (the common case, `fs_bsize ≤ PAGE_SIZE`) this
+reduces to the classic `fragment_address / fs_frag`.
+
+### Address calculation (mirrors OpenBSD macros)
+
+```c
+cgbase(cg)  = fs_fpg × cg
+cgstart(cg) = cgbase(cg) + fs_cgoffset × (cg & ~fs_cgmask)  // UFS1
+cgimin(cg)  = cgstart(cg) + fs_iblkno
+fsba(ino)   = cgimin(cg) + (ino_in_cg / fs_inopb) × fs_frag
+fsbo(ino)   = ino_in_cg % fs_inopb
+block_num   = fsba(ino) / fs_frag
+```
+
+---
+
+## Thread Safety (Concurrent I/O)
+
+The `min(fs_bsize, PAGE_SIZE)` large-block-size strategy is **fully
+concurrent-safe**.  No additional locking is needed in the driver beyond
+what the Linux VFS and buffer cache already provide.
+
+| Component | Safety rationale |
+|-----------|-----------------|
+| `sbi->fs_io_bsize` | Computed once in `fill_super()`; read-only for the lifetime of the mount. |
+| `ufs_block_map()` | Stateless arithmetic over the inode's read-only block-pointer array (`ui->i_u`). |
+| `ufs_read_indir()` | Each call issues an independent `sb_bread()` for a single I/O block number. |
+| Linux buffer cache | `BH_Lock` serialises concurrent readers of the *same* physical block automatically. |
+| Sub-block reads | When `fs_io_bsize < fs_bsize`, two threads reading different pages of the same FFS block call `sb_bread()` for *different* block numbers — the buffer cache handles each independently. |
+| Inode block pointers | Set atomically during `ufs_iget()` under `I_NEW`; thereafter read-only; protected by the VFS inode cache. |
+
+The same analysis applies to the single-indirect, double-indirect, and
+triple-indirect paths: they all reduce to sequences of independent
+`sb_bread()` → read → `brelse()` operations on immutable data.
+
+---
+
+## Building
+
+### Prerequisites
+
+```bash
+sudo apt-get install -y linux-headers-$(uname -r) build-essential
+```
+
+### Compile
+
+```bash
+cd linux-ufs
+make
+```
+
+The output is `linux_ufs.ko`.
+
+---
+
+## Testing
+
+### 1. Validate image structure (no root required)
+
+```bash
+# Create test images
+python3 create_ufs1.py /tmp/test.ufs    # FFS1/UFS1
+python3 create_ufs2.py /tmp/test.ufs2  # FFS2/UFS2
+
+# Build the userspace reader
+gcc -O2 -o /tmp/ufs_reader ufs_reader.c
+
+# Validate FFS1 image
+/tmp/ufs_reader /tmp/test.ufs
+
+# Validate FFS2 image
+/tmp/ufs_reader /tmp/test.ufs2
+```
+
+Expected output includes:
+```
+=== UFS Superblock ===
+  Version  : UFS1
+  Magic    : 0x00011954
+  Volume   : TestVol
+  bsize    : 4096
+  ...
+
+=== Root Directory Contents ===
+  ino=2    type=4 name=.
+  ino=2    type=4 name=..
+  ino=3    type=8 name=hello.txt
+
+=== File Contents ===
+Hello from UFS1!
+...
+=== All checks PASSED ===
+```
+
+### 2. Load and mount (requires root)
+
+```bash
+# Load the kernel module
+sudo insmod linux_ufs.ko
+
+# Verify registration
+cat /proc/filesystems | grep ufs2bsd
+
+# --- FFS1 ---
+python3 create_ufs1.py /tmp/test.ufs
+sudo losetup /dev/loop0 /tmp/test.ufs
+sudo mkdir -p /mnt/ufstest
+sudo mount -t ufs2bsd -o ro /dev/loop0 /mnt/ufstest
+ls -la /mnt/ufstest/
+cat /mnt/ufstest/hello.txt
+df -h /mnt/ufstest
+sudo umount /mnt/ufstest && sudo losetup -d /dev/loop0
+
+# --- FFS2 ---
+python3 create_ufs2.py /tmp/test.ufs2
+sudo losetup /dev/loop0 /tmp/test.ufs2
+sudo mount -t ufs2bsd -o ro /dev/loop0 /mnt/ufstest
+ls -la /mnt/ufstest/
+cat /mnt/ufstest/hello.txt
+sudo umount /mnt/ufstest && sudo losetup -d /dev/loop0
+
+sudo rmmod linux_ufs
+```
+
+### 3. Test with a real BSD disk image (OpenBSD/FreeBSD)
+
+If you have an OpenBSD VM or install medium:
+
+```bash
+# Extract the image (e.g. from QEMU block device)
+qemu-img convert -f qcow2 openbsd.qcow2 -O raw openbsd.raw
+
+# Mount the UFS partition (skip MBR partitions as needed)
+sudo losetup -P /dev/loop0 openbsd.raw
+sudo mount -t ufs2bsd -o ro /dev/loop0p3 /mnt/ufstest
+```
+
+### 4. Test with `newfs` from freebsd-tools (Debian/Ubuntu)
+
+```bash
+sudo apt-get install -y freebsd-ufs-fuse  # if available, or use a FreeBSD container
+```
+
+Or use FreeBSD in Docker:
+
+```bash
+# Build a real UFS image using FreeBSD tools
+docker run --rm --privileged freebsd/freebsd-docker-image sh -c "
+  dd if=/dev/zero of=/tmp/disk.img bs=1M count=64
+  mdconfig -f /tmp/disk.img -t vnode
+  newfs /dev/md0
+  mount /dev/md0 /mnt
+  echo 'hello from newfs' > /mnt/test.txt
+  umount /mnt
+  mdconfig -d -u 0
+" && \
+sudo losetup /dev/loop0 /tmp/disk.img && \
+sudo mount -t ufs2bsd -o ro /dev/loop0 /mnt/ufstest && \
+cat /mnt/ufstest/test.txt
+```
+
+---
+
+## Design notes
+
+### Read-only
+
+The driver is intentionally **read-only** (`SB_RDONLY`). Write support requires
+implementing fragment allocation, inode updates, journal replay (for soft
+updates), and is left as a future exercise.
+
+### Direct + indirect block mapping
+
+`ufs_block_map()` handles all four levels of block indirection, mirroring
+OpenBSD `ffs_indirtrunc()`:
+
+```
+Level        Blocks supported         Formula
+-----        ----------------         -------
+Direct       di_db[0..11]             iblock < 12
+Single ind.  di_ib[0]                 +nindir
+Double ind.  di_ib[1]                 +nindir²
+Triple ind.  di_ib[2]                 +nindir³
+```
+
+For `fs_bsize = 8192` with UFS2 (64-bit, `nindir = 1024`):
+```
+max file size ≈ 12×8KB + 1024×8KB + 1024²×8KB + 1024³×8KB ≈ 8 TiB
+```
+
+### Inline symlinks
+
+Short symbolic links (≤ 60 bytes for UFS1, ≤ 120 bytes for UFS2) are stored
+directly in the inode's `di_db[]` field array and returned without any I/O.
+
+### Filesystem type name
+
+The module registers as `ufs2bsd` to avoid conflicting with the existing Linux
+UFS driver (`ufs`) already in the kernel.
+
+---
+
+## Comparison with OpenBSD UFS
+
+| OpenBSD | Linux driver |
+|---------|--------------|
+| `ffs_vfsops.c` | `super.c` |
+| `ffs_inode.c` | `inode.c` |
+| `ufs_lookup.c` | `dir.c` |
+| `ufs_vnops.c` | `file.c` |
+| `struct vfsops` | `struct super_operations` |
+| `struct vnodeops` | `struct inode_operations` + `struct file_operations` |
+| `vnode` | `struct inode` + `struct file` |
+| `VOP_LOOKUP` | `inode_operations.lookup` |
+| `VOP_READDIR` | `file_operations.iterate_shared` |
+| `VOP_READ` | `address_space_operations.read_folio` via `mpage` |
+| `bread()` | `sb_bread()` |
+| `brelse()` | `brelse()` |
+
+---
+
+## License
+
+GPL v2 — see `SPDX-License-Identifier: GPL-2.0` in each source file.
