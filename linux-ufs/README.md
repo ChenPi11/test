@@ -53,19 +53,36 @@ Per cylinder group:
 
 ### Block-size strategy
 
-Linux requires `sb->s_blocksize ≥ 1024`. UFS fragment sizes can be as small
-as 512 bytes. The driver therefore sets:
+BSD VFS imposes no `PAGE_SIZE` constraint on block size because its buffer
+cache tracks block size independently of the VM page size.  OpenBSD's
+`newfs(8)` defaults to `fs_bsize = 16 KiB` regardless of the host's page
+size.
+
+Linux requires `sb->s_blocksize ≤ PAGE_SIZE`.  This driver resolves the
+incompatibility by clamping the VFS I/O block size:
 
 ```
-sb->s_blocksize = fs_bsize  (e.g. 4096 or 8192)
+fs_io_bsize = min(fs_bsize, PAGE_SIZE)
+sb->s_blocksize = fs_io_bsize
 ```
+
+When `fs_io_bsize < fs_bsize` (large-block images), each FFS block is read as
+`fs_bsize / fs_io_bsize` consecutive VFS I/O blocks.  The block-mapping
+arithmetic in `ufs_block_map()` and `ufs_iget()` accounts for this.
+
+One hard constraint remains: `fs_fsize` (fragment size) must be ≤ `PAGE_SIZE`.
+If `fs_fsize > PAGE_SIZE` the driver rejects the filesystem with `-EINVAL`.
 
 Fragment addresses from inode pointers (`di_db[]`, `di_ib[]`) are converted to
-Linux block numbers by dividing by `fs_frag`:
+VFS I/O block numbers:
 
 ```
-linux_block = fragment_address / fs_frag
+iofrags      = fs_io_bsize / fs_fsize    (fragments per VFS I/O block)
+io_block_num = fragment_address / iofrags
 ```
+
+When `fs_io_bsize == fs_bsize` (the common case, `fs_bsize ≤ PAGE_SIZE`) this
+reduces to the classic `fragment_address / fs_frag`.
 
 ### Address calculation (mirrors OpenBSD macros)
 
@@ -77,6 +94,27 @@ fsba(ino)   = cgimin(cg) + (ino_in_cg / fs_inopb) × fs_frag
 fsbo(ino)   = ino_in_cg % fs_inopb
 block_num   = fsba(ino) / fs_frag
 ```
+
+---
+
+## Thread Safety (Concurrent I/O)
+
+The `min(fs_bsize, PAGE_SIZE)` large-block-size strategy is **fully
+concurrent-safe**.  No additional locking is needed in the driver beyond
+what the Linux VFS and buffer cache already provide.
+
+| Component | Safety rationale |
+|-----------|-----------------|
+| `sbi->fs_io_bsize` | Computed once in `fill_super()`; read-only for the lifetime of the mount. |
+| `ufs_block_map()` | Stateless arithmetic over the inode's read-only block-pointer array (`ui->i_u`). |
+| `ufs_read_indir()` | Each call issues an independent `sb_bread()` for a single I/O block number. |
+| Linux buffer cache | `BH_Lock` serialises concurrent readers of the *same* physical block automatically. |
+| Sub-block reads | When `fs_io_bsize < fs_bsize`, two threads reading different pages of the same FFS block call `sb_bread()` for *different* block numbers — the buffer cache handles each independently. |
+| Inode block pointers | Set atomically during `ufs_iget()` under `I_NEW`; thereafter read-only; protected by the VFS inode cache. |
+
+The same analysis applies to the single-indirect, double-indirect, and
+triple-indirect paths: they all reduce to sequences of independent
+`sb_bread()` → read → `brelse()` operations on immutable data.
 
 ---
 

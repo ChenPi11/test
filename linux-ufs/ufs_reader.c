@@ -195,6 +195,24 @@ static int read_superblock(ufs_sb_t *sb)
 			}
 
 			/*
+			 * The Linux kernel driver requires fs_fsize <= PAGE_SIZE.
+			 * When fs_fsize > PAGE_SIZE, individual fragments cannot
+			 * be mapped into a single page, which is unsupported.
+			 * (This mirrors the check in super.c ufs_fill_super().)
+			 *
+			 * fs_bsize > PAGE_SIZE is fine: the driver uses
+			 * fs_io_bsize = min(fs_bsize, PAGE_SIZE) and handles the
+			 * sub-blocking arithmetic in ufs_block_map() / ufs_iget().
+			 */
+			if (sb->fsize > (uint32_t)getpagesize()) {
+				fprintf(stderr,
+				    "ERROR: fragment size %u exceeds page size "
+				    "(%d); not supported by the kernel driver\n",
+				    sb->fsize, getpagesize());
+				return -2;
+			}
+
+			/*
 			 * FFS1 superblock checksum (warning only).
 			 * Mirrors the check in super.c ufs_parse_superblock().
 			 * At clean-unmount time: fs_state = FS_OKAY - fs_ffs1_time.

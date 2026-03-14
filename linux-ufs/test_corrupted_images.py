@@ -94,6 +94,11 @@ FFS2_NINDIR  = FFS2_BSIZE // 8            # 4096
 FFS1_IMG_SIZE  = max(SBLOCK_UFS1 + SB_SIZE + 4096, 65536)
 FFS2_IMG_SIZE  = SBLOCK_UFS2 + SB_SIZE + 65536
 
+# ─── System page size (matches kernel PAGE_SIZE used in super.c) ──────────────
+# This determines which fsize values are accepted vs. rejected by the driver.
+# Typical values: 4096 (x86_64), 16384 (ARM64 Debian kernel), 65536 (some ARM64).
+LINUX_PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')
+
 
 # ─── Low-level helpers ────────────────────────────────────────────────────────
 
@@ -513,6 +518,289 @@ class TestValidBaselines(_Base):
         volname = b'TestVolume\x00'
         sb_bytes[680:680 + len(volname)] = volname
         self._check_clean(_wrap_ffs1(bytes(sb_bytes)), label='valid_ffs1_volname')
+
+
+# ─── Block-size tests ─────────────────────────────────────────────────────────
+
+class TestBlockSize(_Base):
+    """
+    Tests for block-size and fragment-size related checks.
+
+    The Linux UFS driver enforces two constraints that BSD does not:
+      1. fs_fsize must be <= PAGE_SIZE  (fragments must fit in a page)
+      2. fs_bsize may exceed PAGE_SIZE; the driver uses
+         fs_io_bsize = min(fs_bsize, PAGE_SIZE) and adjusts block-
+         mapping arithmetic accordingly.
+
+    These tests use the actual system PAGE_SIZE (LINUX_PAGE_SIZE) so they
+    are correct regardless of architecture (4 KiB, 16 KiB, 64 KiB, …).
+
+    Concurrent I/O analysis
+    ───────────────────────
+    The min(fs_bsize, PAGE_SIZE) approach does NOT introduce concurrent-I/O
+    issues:
+
+    • sbi->fs_io_bsize is computed once in ufs_fill_super() and is read-only
+      for the lifetime of the mount.  No synchronisation needed.
+
+    • ufs_block_map() is a stateless computation over the inode's read-only
+      block-pointer array (ui->i_u) plus calls to ufs_read_indir() which
+      each do an independent sb_bread().
+
+    • sb_bread() uses Linux's buffer-cache locking (BH_Lock) to serialise
+      concurrent reads of the same physical block.  Multiple concurrent
+      callers for the same or different blocks are handled correctly without
+      any additional locking in the UFS driver.
+
+    • When fs_io_bsize < fs_bsize, a single FFS block maps to
+      (fs_bsize / fs_io_bsize) consecutive I/O blocks.  Two threads reading
+      different pages of the same FFS block will call sb_bread() for
+      *different* block numbers; the buffer-cache handles each independently.
+
+    Conclusion: the implementation is concurrent-safe.
+    """
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ffs1_large_fsize_params():
+        """Return (fsize, bsize, frag, nindir, inopb) for fsize = PAGE_SIZE*2."""
+        fsize  = LINUX_PAGE_SIZE * 2          # exceeds page size → rejected
+        bsize  = fsize * 8                    # frag = 8, always valid ratio
+        frag   = bsize // fsize               # = 8
+        nindir = bsize // 4                   # UFS1 uses 32-bit pointers
+        inopb  = bsize // 128                 # UFS1 dinode is 128 bytes
+        return fsize, bsize, frag, nindir, inopb
+
+    @staticmethod
+    def _ffs2_large_fsize_params():
+        """Return (fsize, bsize, frag, nindir, inopb) for fsize = PAGE_SIZE*2."""
+        fsize  = LINUX_PAGE_SIZE * 2
+        bsize  = fsize * 8
+        frag   = bsize // fsize               # = 8
+        nindir = bsize // 8                   # UFS2 uses 64-bit pointers
+        inopb  = bsize // 256                 # UFS2 dinode is 256 bytes
+        return fsize, bsize, frag, nindir, inopb
+
+    @staticmethod
+    def _ffs1_large_bsize_params():
+        """Return (bsize, fsize, frag, nindir, inopb) for bsize = PAGE_SIZE*4."""
+        bsize  = LINUX_PAGE_SIZE * 4          # exceeds page size → uses io_bsize
+        fsize  = 512                          # always <= PAGE_SIZE; valid
+        frag   = bsize // fsize
+        nindir = bsize // 4
+        inopb  = bsize // 128
+        return bsize, fsize, frag, nindir, inopb
+
+    @staticmethod
+    def _ffs2_large_bsize_params():
+        """Return (bsize, fsize, frag, nindir, inopb) for bsize = PAGE_SIZE*4."""
+        bsize  = LINUX_PAGE_SIZE * 4
+        fsize  = max(512, LINUX_PAGE_SIZE // 4)  # <= PAGE_SIZE; power-of-2
+        frag   = bsize // fsize
+        nindir = bsize // 8
+        inopb  = bsize // 256
+        return bsize, fsize, frag, nindir, inopb
+
+    # ── fs_fsize > PAGE_SIZE → fatal ─────────────────────────────────────────
+
+    def test_ffs1_fsize_gt_page_size(self):
+        """
+        FFS1 with fs_fsize = PAGE_SIZE*2 → 'fragment size ... exceeds page size'.
+        Mirrors super.c: sbi->fs_fsize > PAGE_SIZE → -EINVAL.
+        """
+        fsize, bsize, frag, nindir, inopb = self._ffs1_large_fsize_params()
+        sb = _make_ffs1_sb(bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS1 + SB_SIZE + bsize * 2, 65536)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS1:SBLOCK_UFS1 + SB_SIZE] = sb
+        self._check_fatal(bytes(img), 'fragment size',
+                          label='ffs1_fsize_gt_page_size')
+
+    def test_ffs2_fsize_gt_page_size(self):
+        """
+        FFS2 with fs_fsize = PAGE_SIZE*2 → 'fragment size ... exceeds page size'.
+        """
+        fsize, bsize, frag, nindir, inopb = self._ffs2_large_fsize_params()
+        sb = _make_ffs2_sb(bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS2 + SB_SIZE + bsize * 2, 131072)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS2:SBLOCK_UFS2 + SB_SIZE] = sb
+        self._check_fatal(bytes(img), 'fragment size',
+                          label='ffs2_fsize_gt_page_size')
+
+    # ── fs_fsize not a power of 2 → fatal sanity check ───────────────────────
+
+    def test_ffs1_fsize_nonpow2(self):
+        """
+        FFS1 with fs_fsize=3000 (not power of 2) → sanity check failed.
+        Mirrors IS_POW2(sb->fsize) check in ufs_reader / is_power_of_2 in super.c.
+        """
+        sb = _make_ffs1_sb(bsize=8192, fsize=3000, frag=2)
+        self._check_fatal(_wrap_ffs1(sb), 'sanity check failed',
+                          label='ffs1_fsize_nonpow2')
+
+    def test_ffs2_fsize_nonpow2(self):
+        """FFS2 with fs_fsize=6000 (not power of 2) → sanity check failed."""
+        sb = _make_ffs2_sb(bsize=32768, fsize=6000, frag=5)
+        self._check_fatal(_wrap_ffs2(sb), 'sanity check failed',
+                          label='ffs2_fsize_nonpow2')
+
+    # ── fs_bsize > PAGE_SIZE with fs_fsize <= PAGE_SIZE → valid ──────────────
+
+    def test_ffs1_large_bsize_valid(self):
+        """
+        FFS1 with fs_bsize = PAGE_SIZE*4, fs_fsize = 512.
+        The driver uses io_bsize = min(bsize, PAGE_SIZE) = PAGE_SIZE.
+        Must succeed with no errors or warnings.
+        """
+        bsize, fsize, frag, nindir, inopb = self._ffs1_large_bsize_params()
+        now = int(time.time()) & 0xFFFFFFFF
+        sb = _make_ffs1_sb(now=now, bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS1 + SB_SIZE + bsize, 131072)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS1:SBLOCK_UFS1 + SB_SIZE] = sb
+        path = _write_tmp(bytes(img))
+        try:
+            rc, out, err = _run_reader(path)
+            self.assertEqual(rc, 0,
+                msg=f'ffs1_large_bsize_valid: expected exit 0 but got {rc}\n'
+                    f'stdout={out!r}\nstderr={err!r}')
+            self.assertNotIn('ERROR', err,
+                msg=f'ffs1_large_bsize_valid: unexpected ERROR\n{err}')
+            self.assertIn('Found superblock', out,
+                msg=f'ffs1_large_bsize_valid: expected "Found superblock"\n{out}')
+        finally:
+            os.unlink(path)
+
+    def test_ffs2_large_bsize_valid(self):
+        """
+        FFS2 with fs_bsize = PAGE_SIZE*4, fs_fsize <= PAGE_SIZE.
+        Must succeed: driver uses io_bsize = min(bsize, PAGE_SIZE).
+        """
+        bsize, fsize, frag, nindir, inopb = self._ffs2_large_bsize_params()
+        sb = _make_ffs2_sb(bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS2 + SB_SIZE + bsize, 131072)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS2:SBLOCK_UFS2 + SB_SIZE] = sb
+        path = _write_tmp(bytes(img))
+        try:
+            rc, out, err = _run_reader(path)
+            self.assertEqual(rc, 0,
+                msg=f'ffs2_large_bsize_valid: expected exit 0 but got {rc}\n'
+                    f'stdout={out!r}\nstderr={err!r}')
+            self.assertNotIn('ERROR', err,
+                msg=f'ffs2_large_bsize_valid: unexpected ERROR\n{err}')
+            self.assertIn('Found superblock', out,
+                msg=f'ffs2_large_bsize_valid: expected "Found superblock"\n{out}')
+        finally:
+            os.unlink(path)
+
+    # ── fs_bsize = PAGE_SIZE (exact boundary) → valid ────────────────────────
+
+    def test_ffs1_bsize_equals_page_size(self):
+        """
+        FFS1 with fs_bsize exactly equal to PAGE_SIZE.
+        io_bsize = min(PAGE_SIZE, PAGE_SIZE) = PAGE_SIZE → standard path.
+        """
+        bsize  = LINUX_PAGE_SIZE
+        fsize  = max(512, LINUX_PAGE_SIZE // 8)
+        frag   = bsize // fsize
+        nindir = bsize // 4
+        inopb  = bsize // 128
+        now = int(time.time()) & 0xFFFFFFFF
+        sb = _make_ffs1_sb(now=now, bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS1 + SB_SIZE + bsize, 65536)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS1:SBLOCK_UFS1 + SB_SIZE] = sb
+        path = _write_tmp(bytes(img))
+        try:
+            rc, out, err = _run_reader(path)
+            self.assertEqual(rc, 0,
+                msg=f'ffs1_bsize_eq_page: expected exit 0 but got {rc}\n'
+                    f'stdout={out!r}\nstderr={err!r}')
+            self.assertIn('Found superblock', out)
+        finally:
+            os.unlink(path)
+
+    def test_ffs2_bsize_equals_page_size(self):
+        """FFS2 with fs_bsize exactly equal to PAGE_SIZE → valid."""
+        bsize  = LINUX_PAGE_SIZE
+        fsize  = max(512, LINUX_PAGE_SIZE // 8)
+        frag   = bsize // fsize
+        nindir = bsize // 8
+        inopb  = bsize // 256
+        if inopb == 0:
+            self.skipTest('PAGE_SIZE too small for UFS2 (inopb would be 0)')
+        sb = _make_ffs2_sb(bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS2 + SB_SIZE + bsize, 131072)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS2:SBLOCK_UFS2 + SB_SIZE] = sb
+        path = _write_tmp(bytes(img))
+        try:
+            rc, out, err = _run_reader(path)
+            self.assertEqual(rc, 0,
+                msg=f'ffs2_bsize_eq_page: expected exit 0 but got {rc}\n'
+                    f'stdout={out!r}\nstderr={err!r}')
+            self.assertIn('Found superblock', out)
+        finally:
+            os.unlink(path)
+
+    # ── fs_fsize = PAGE_SIZE (exact boundary) → valid ────────────────────────
+
+    def test_ffs1_fsize_equals_page_size(self):
+        """
+        FFS1 with fs_fsize exactly equal to PAGE_SIZE.
+        fs_fsize == PAGE_SIZE is the largest accepted fragment size.
+        """
+        fsize  = LINUX_PAGE_SIZE
+        bsize  = fsize * 8
+        frag   = 8
+        nindir = bsize // 4
+        inopb  = bsize // 128
+        now = int(time.time()) & 0xFFFFFFFF
+        sb = _make_ffs1_sb(now=now, bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS1 + SB_SIZE + bsize, 65536)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS1:SBLOCK_UFS1 + SB_SIZE] = sb
+        path = _write_tmp(bytes(img))
+        try:
+            rc, out, err = _run_reader(path)
+            self.assertEqual(rc, 0,
+                msg=f'ffs1_fsize_eq_page: expected exit 0 but got {rc}\n'
+                    f'stdout={out!r}\nstderr={err!r}')
+            self.assertIn('Found superblock', out)
+        finally:
+            os.unlink(path)
+
+    def test_ffs2_fsize_equals_page_size(self):
+        """FFS2 with fs_fsize exactly equal to PAGE_SIZE → valid."""
+        fsize  = LINUX_PAGE_SIZE
+        bsize  = fsize * 8
+        frag   = 8
+        nindir = bsize // 8
+        inopb  = bsize // 256
+        sb = _make_ffs2_sb(bsize=bsize, fsize=fsize, frag=frag,
+                           nindir=nindir, inopb=inopb)
+        img_size = max(SBLOCK_UFS2 + SB_SIZE + bsize, 131072)
+        img = bytearray(img_size)
+        img[SBLOCK_UFS2:SBLOCK_UFS2 + SB_SIZE] = sb
+        path = _write_tmp(bytes(img))
+        try:
+            rc, out, err = _run_reader(path)
+            self.assertEqual(rc, 0,
+                msg=f'ffs2_fsize_eq_page: expected exit 0 but got {rc}\n'
+                    f'stdout={out!r}\nstderr={err!r}')
+            self.assertIn('Found superblock', out)
+        finally:
+            os.unlink(path)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
