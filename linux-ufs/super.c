@@ -312,19 +312,31 @@ static int ufs_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 	/*
-	 * Set the VFS block size to the filesystem block size (fs_bsize).
+	 * Set the VFS block size to fs_io_bsize = min(fs_bsize, PAGE_SIZE).
 	 *
-	 * We intentionally use fs_bsize (not fs_fsize) because:
-	 *  - Linux requires sb->s_blocksize >= BLOCK_SIZE (1024).
-	 *  - fs_fsize may be 512, which is below that minimum.
-	 *  - UFS fragment addresses can be converted to block numbers by
-	 *    dividing by fs_frag (= fs_bsize / fs_fsize).
+	 * Linux requires sb->s_blocksize <= PAGE_SIZE.  OpenBSD's default
+	 * fs_bsize is 16 KiB (newfs(8) default) or 32 KiB (on large-RAM
+	 * systems), both of which can exceed PAGE_SIZE on kernels built with
+	 * 4 KiB pages.  By using min(fs_bsize, PAGE_SIZE) we support all
+	 * valid FFS images regardless of their block size.
 	 *
-	 * All block numbers passed to sb_bread() are therefore in units of
-	 * fs_bsize, and fragment_addr / fs_frag gives the block number.
+	 * Constraint: fs_fsize must be <= PAGE_SIZE (otherwise individual
+	 * fragments don't fit in a page, which is unsupported).
+	 *
+	 * When fs_io_bsize < fs_bsize, each FFS block is read as
+	 * (fs_bsize / fs_io_bsize) consecutive VFS I/O blocks; the block
+	 * mapping arithmetic in inode.c accounts for this.
 	 */
-	if (!sb_set_blocksize(sb, sbi->fs_bsize)) {
-		pr_err("ufs: unsupported block size %u\n", sbi->fs_bsize);
+	if (sbi->fs_fsize > PAGE_SIZE) {
+		pr_err("ufs: fragment size %u exceeds PAGE_SIZE %lu; not supported\n", sbi->fs_fsize, PAGE_SIZE);
+		ret = -EINVAL;
+		goto err_sbi;
+	}
+	sbi->fs_io_bsize = min_t(u32, sbi->fs_bsize, (u32)PAGE_SIZE);
+
+	if (!sb_set_blocksize(sb, sbi->fs_io_bsize)) {
+		pr_err("ufs: cannot set I/O block size %u (fs_bsize=%u, PAGE_SIZE=%lu)\n",
+		       sbi->fs_io_bsize, sbi->fs_bsize, PAGE_SIZE);
 		ret = -EINVAL;
 		goto err_sbi;
 	}
@@ -348,10 +360,12 @@ static int ufs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto err_sbi;
 	}
 
-	pr_info("ufs: mounted %s (UFS%s, block=%u, frag=%u, ncg=%u)\n",
+	pr_info("ufs: mounted %s (UFS%s, fs_bsize=%u, fs_fsize=%u, "
+		"io_bsize=%u, ncg=%u)\n",
 		sbi->fs_volname[0] ? sbi->fs_volname : "(unnamed)",
 		sbi->fs_ufs2 ? "2" : "1",
-		sbi->fs_bsize, sbi->fs_fsize, sbi->fs_ncg);
+		sbi->fs_bsize, sbi->fs_fsize,
+		sbi->fs_io_bsize, sbi->fs_ncg);
 
 	return 0;
 

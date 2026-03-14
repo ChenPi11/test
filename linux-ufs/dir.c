@@ -72,10 +72,15 @@ static struct buffer_head *ufs_dir_bread(struct inode *dir, sector_t frag)
 static int ufs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
-	struct ufs_sb_info *sbi = UFS_SB(inode->i_sb);
 	loff_t pos = ctx->pos;
 	loff_t dir_size = inode->i_size;
-	unsigned bsize = sbi->fs_bsize;	/* bytes per logical block == fs_bsize */
+	/*
+	 * Use sb->s_blocksize (= fs_io_bsize) as the I/O granularity.
+	 * Directory entries are padded to 4-byte boundaries and are never
+	 * larger than UFS_DIRBLKSIZ (512) bytes, so they always fit within
+	 * a single I/O block (>= BLOCK_SIZE = 1024).
+	 */
+	unsigned bsize = inode->i_sb->s_blocksize;
 
 	/* Skip the empty directory case */
 	if (pos >= dir_size)
@@ -144,8 +149,7 @@ static int ufs_readdir(struct file *file, struct dir_context *ctx)
 static struct dentry *ufs_lookup(struct inode *dir, struct dentry *dentry,
 				 unsigned int flags)
 {
-	struct ufs_sb_info *sbi = UFS_SB(dir->i_sb);
-	unsigned bsize     = sbi->fs_bsize;
+	unsigned bsize     = dir->i_sb->s_blocksize;
 	loff_t   dir_size  = dir->i_size;
 	const char  *name  = dentry->d_name.name;
 	unsigned     nlen  = dentry->d_name.len;

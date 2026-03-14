@@ -22,93 +22,120 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * Read one block pointer from the indirect block at block number @blkno,
- * at index @idx within that block.
+ * Read one block pointer from the indirect block whose VFS I/O block number
+ * starts at @indir_io_blk, at FFS-block index @idx within that indirect block.
  *
  * UFS1 uses 32-bit pointers; UFS2 uses 64-bit pointers.
- * Returns the fragment address stored there, or 0 for a hole/error.
+ * Returns the fragment address stored at @idx, or 0 on hole/error.
+ *
+ * Because sb->s_blocksize (= fs_io_bsize) may be smaller than fs_bsize
+ * (when fs_bsize > PAGE_SIZE), an indirect block can span multiple VFS I/O
+ * blocks.  We calculate which I/O block holds pointer @idx and read it.
  *
  * This helper mirrors the inner loop of OpenBSD's ffs_indirtrunc().
  */
-static u64 ufs_read_indir(struct super_block *sb, u64 blkno, u64 idx, int ufs2)
+static u64 ufs_read_indir(struct super_block *sb, u64 indir_io_blk,
+			   u64 idx, int ufs2)
 {
+	struct ufs_sb_info *sbi = UFS_SB(sb);
+	u32 ptr_size      = ufs2 ? sizeof(__le64) : sizeof(__le32);
+	u32 ptrs_per_ioblk = sbi->fs_io_bsize / ptr_size;
+	u64 blk_offset    = idx / ptrs_per_ioblk;
+	u64 idx_in_blk    = idx % ptrs_per_ioblk;
 	struct buffer_head *bh;
 	u64 result = 0;
 
-	bh = sb_bread(sb, blkno);
+	bh = sb_bread(sb, indir_io_blk + blk_offset);
 	if (!bh)
 		return 0;
 
 	if (ufs2) {
 		__le64 *ptrs = (__le64 *)bh->b_data;
-		result = le64_to_cpu(ptrs[idx]);
+		result = le64_to_cpu(ptrs[idx_in_blk]);
 	} else {
 		__le32 *ptrs = (__le32 *)bh->b_data;
-		result = le32_to_cpu(ptrs[idx]);
+		result = le32_to_cpu(ptrs[idx_in_blk]);
 	}
 	brelse(bh);
 	return result;
 }
 
 /*
- * Map logical block number @iblock (in units of sb->s_blocksize = fs_bsize)
- * to the physical block number on disk (also in units of fs_bsize).
+ * Map logical VFS block number @iblock (in units of sb->s_blocksize =
+ * fs_io_bsize) to the physical VFS I/O block number on disk.
  *
- * UFS stores block pointers as fragment addresses; divide by fs_frag to get
- * the Linux block number.  Returns 0 for a hole / unmapped block.
+ * fs_io_bsize = min(fs_bsize, PAGE_SIZE).
  *
- * Mirrors the three indirection levels (SINGLE/DOUBLE/TRIPLE) described in
- * OpenBSD sys/ufs/ffs/ffs_inode.c.  Both UFS1 (32-bit pointers) and UFS2
- * (64-bit pointers) are handled via the ufs_read_indir() helper.
+ * When fs_io_bsize == fs_bsize (the common case, fs_bsize <= PAGE_SIZE):
+ *   - iblock is a FFS block index (same as before)
+ *   - Return value is frag_addr / fs_frag
+ *
+ * When fs_io_bsize < fs_bsize (fs_bsize > PAGE_SIZE):
+ *   - Each FFS block maps to io_per_ffs = fs_bsize / fs_io_bsize VFS blocks
+ *   - ffs_blk = iblock / io_per_ffs   (FFS block index)
+ *   - io_off  = iblock % io_per_ffs   (VFS block offset within FFS block)
+ *   - iofrags = fs_io_bsize / fs_fsize (fragments per VFS I/O block)
+ *   - Return: frag_addr / iofrags + io_off
+ *
+ * Returns 0 for a hole or unmapped block.
+ *
+ * Mirrors the three indirection levels (SINGLE/DOUBLE/TRIPLE) in
+ * OpenBSD sys/ufs/ffs/ffs_inode.c.
  */
 u64 ufs_block_map(struct inode *inode, sector_t iblock)
 {
 	struct ufs_sb_info   *sbi = UFS_SB(inode->i_sb);
 	struct ufs_inode_info *ui = UFS_I(inode);
-	int   ufs2   = sbi->fs_ufs2;
-	u64   frag   = sbi->fs_frag;
-	u64   nindir = sbi->fs_nindir;
+	int   ufs2    = sbi->fs_ufs2;
+	u64   nindir  = sbi->fs_nindir;
+	/* iofrags: fragments per VFS I/O block = fs_io_bsize / fs_fsize */
+	u64   iofrags = sbi->fs_io_bsize / sbi->fs_fsize;
+	/* io_per_ffs: VFS I/O blocks per FFS block = fs_bsize / fs_io_bsize */
+	u64   io_per_ffs = sbi->fs_bsize / sbi->fs_io_bsize;
+	/* ffs_blk: FFS block index; io_off: VFS sub-block within FFS block */
+	u64   ffs_blk = (u64)iblock / io_per_ffs;
+	u64   io_off  = (u64)iblock % io_per_ffs;
 	u64   frag_addr;
 
 	/* ---- Direct blocks (di_db[0..11]) ---- */
-	if (iblock < UFS_NDADDR) {
-		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.db[iblock])
-				 : le32_to_cpu(ui->i_u.i1.db[iblock]);
-		return frag_addr ? frag_addr / frag : 0;
+	if (ffs_blk < UFS_NDADDR) {
+		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.db[ffs_blk])
+				 : le32_to_cpu(ui->i_u.i1.db[ffs_blk]);
+		return frag_addr ? frag_addr / iofrags + io_off : 0;
 	}
-	iblock -= UFS_NDADDR;
+	ffs_blk -= UFS_NDADDR;
 
-	/* ---- Single-indirect (di_ib[0]) ---- */
-	if (iblock < nindir) {
+	/* ---- Single-indirect (di_ib[0]): nindir FFS blocks ---- */
+	if (ffs_blk < nindir) {
 		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.ib[0])
 				 : le32_to_cpu(ui->i_u.i1.ib[0]);
 		if (!frag_addr)
 			return 0;
 		frag_addr = ufs_read_indir(inode->i_sb,
-					   frag_addr / frag, iblock, ufs2);
-		return frag_addr ? frag_addr / frag : 0;
+					   frag_addr / iofrags, ffs_blk, ufs2);
+		return frag_addr ? frag_addr / iofrags + io_off : 0;
 	}
-	iblock -= nindir;
+	ffs_blk -= nindir;
 
-	/* ---- Double-indirect (di_ib[1]) ---- */
-	if (iblock < nindir * nindir) {
+	/* ---- Double-indirect (di_ib[1]): nindir^2 FFS blocks ---- */
+	if (ffs_blk < nindir * nindir) {
 		frag_addr = ufs2 ? le64_to_cpu(ui->i_u.i2.ib[1])
 				 : le32_to_cpu(ui->i_u.i1.ib[1]);
 		if (!frag_addr)
 			return 0;
 		/* Level 1: index into the double-indirect block */
 		frag_addr = ufs_read_indir(inode->i_sb,
-					   frag_addr / frag,
-					   iblock / nindir, ufs2);
+					   frag_addr / iofrags,
+					   ffs_blk / nindir, ufs2);
 		if (!frag_addr)
 			return 0;
 		/* Level 2: index into the single-indirect block */
 		frag_addr = ufs_read_indir(inode->i_sb,
-					   frag_addr / frag,
-					   iblock % nindir, ufs2);
-		return frag_addr ? frag_addr / frag : 0;
+					   frag_addr / iofrags,
+					   ffs_blk % nindir, ufs2);
+		return frag_addr ? frag_addr / iofrags + io_off : 0;
 	}
-	iblock -= nindir * nindir;
+	ffs_blk -= nindir * nindir;
 
 	/* ---- Triple-indirect (di_ib[2]) ---- */
 	{
@@ -118,21 +145,21 @@ u64 ufs_block_map(struct inode *inode, sector_t iblock)
 			return 0;
 		/* Level 1 */
 		frag_addr = ufs_read_indir(inode->i_sb,
-					   frag_addr / frag,
-					   iblock / (nindir * nindir), ufs2);
+					   frag_addr / iofrags,
+					   ffs_blk / (nindir * nindir), ufs2);
 		if (!frag_addr)
 			return 0;
 		/* Level 2 */
 		frag_addr = ufs_read_indir(inode->i_sb,
-					   frag_addr / frag,
-					   (iblock / nindir) % nindir, ufs2);
+					   frag_addr / iofrags,
+					   (ffs_blk / nindir) % nindir, ufs2);
 		if (!frag_addr)
 			return 0;
 		/* Level 3 */
 		frag_addr = ufs_read_indir(inode->i_sb,
-					   frag_addr / frag,
-					   iblock % nindir, ufs2);
-		return frag_addr ? frag_addr / frag : 0;
+					   frag_addr / iofrags,
+					   ffs_blk % nindir, ufs2);
+		return frag_addr ? frag_addr / iofrags + io_off : 0;
 	}
 }
 
@@ -380,9 +407,10 @@ static void ufs_set_inode_ops(struct inode *inode)
  *
  * Algorithm (mirrors OpenBSD ffs_vget / ffs_read_inode):
  *   1. Compute the fragment address of the inode table block (fsba).
- *   2. Convert fsba to a block number: block = fsba / fs_frag.
- *   3. Compute the byte offset of the inode within that block.
- *   4. Read the block with sb_bread().
+ *   2. Determine the byte offset of the inode within that block.
+ *   3. Convert to an I/O block number and intra-block offset, accounting
+ *      for fs_io_bsize = min(fs_bsize, PAGE_SIZE).
+ *   4. Read the I/O block with sb_bread().
  *   5. Copy the on-disk dinode into the in-memory inode_info.
  *   6. Set up VFS operations.
  */
@@ -408,18 +436,32 @@ struct inode *ufs_iget(struct super_block *sb, unsigned long ino)
 	fsbo = ufs_ino_to_fsbo(sbi, ino);
 
 	/*
-	 * fsba is the fragment address of the fs_bsize-byte block holding the
-	 * inodes.  sb->s_blocksize == fs_bsize, so the block number is:
-	 *   blk_num    = fsba / fs_frag
-	 * The byte offset of this inode within that block is:
-	 *   off_in_blk = fsbo * sizeof(dinode)
+	 * fsba  = fragment address of the fs_bsize-byte inode table block.
+	 * fsbo  = inode index within that block (0 .. fs_inopb-1).
+	 *
+	 * We read in units of fs_io_bsize (= sb->s_blocksize), which may be
+	 * smaller than fs_bsize when fs_bsize > PAGE_SIZE.
+	 *
+	 * iofrags        = fs_io_bsize / fs_fsize  (frags per I/O block)
+	 * io_blk_base    = fsba / iofrags           (I/O block of table start)
+	 * off_in_ffsblk  = fsbo * dinode_size        (byte offset within table block)
+	 * blk_num        = io_blk_base + off_in_ffsblk / fs_io_bsize
+	 * off_in_blk     = off_in_ffsblk % fs_io_bsize
+	 *
+	 * When fs_io_bsize == fs_bsize (common case):
+	 *   blk_num    = fsba / fs_frag        (same as old code)
+	 *   off_in_blk = fsbo * dinode_size    (same as old code)
 	 */
-	if (sbi->fs_ufs2) {
-		blk_num    = fsba / sbi->fs_frag;
-		off_in_blk = fsbo * sizeof(struct ufs2_dinode);
-	} else {
-		blk_num    = fsba / sbi->fs_frag;
-		off_in_blk = fsbo * sizeof(struct ufs1_dinode);
+	{
+		u32 dinode_size  = sbi->fs_ufs2 ? sizeof(struct ufs2_dinode)
+						: sizeof(struct ufs1_dinode);
+		u32 io_bsize     = sbi->fs_io_bsize;
+		u32 iofrags      = io_bsize / sbi->fs_fsize;
+		u64 io_blk_base  = fsba / iofrags;
+		u32 off_in_ffsblk = (u32)fsbo * dinode_size;
+
+		blk_num    = io_blk_base + off_in_ffsblk / io_bsize;
+		off_in_blk = off_in_ffsblk % io_bsize;
 	}
 
 	pr_debug("ufs: iget ino=%lu fsba=%llu blk=%llu off=%u\n",

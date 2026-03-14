@@ -17,7 +17,7 @@ struct ufs_sb_info {
 	int	fs_ufs2;	/* 1 = UFS2, 0 = UFS1 */
 
 	/* Key superblock fields cached in native byte order */
-	u32	fs_bsize;	/* block size */
+	u32	fs_bsize;	/* block size (fs_bsize from superblock) */
 	u32	fs_fsize;	/* fragment size */
 	u32	fs_frag;	/* fragments per block */
 	u32	fs_ncg;		/* number of cylinder groups */
@@ -29,6 +29,25 @@ struct ufs_sb_info {
 	u32	fs_cgmask;	/* CG mask for UFS1 layout */
 	u32	fs_fsbtodb;	/* fragment -> 512-byte sector shift */
 	u32	fs_nindir;	/* pointers per indirect block */
+
+	/*
+	 * VFS I/O block size used for all sb_bread() calls.
+	 *
+	 * Linux requires sb->s_blocksize <= PAGE_SIZE.  OpenBSD's default
+	 * fs_bsize is 16 KiB (or 32 KiB on large-RAM systems), which can
+	 * exceed PAGE_SIZE on many Linux configurations.  We therefore clamp:
+	 *
+	 *   fs_io_bsize = min(fs_bsize, PAGE_SIZE)
+	 *
+	 * When fs_io_bsize < fs_bsize, each FFS block is read as
+	 * (fs_bsize / fs_io_bsize) consecutive VFS I/O blocks.
+	 *
+	 * Note: BSD VFS does not have an equivalent PAGE_SIZE constraint
+	 * because its buffer cache tracks block size independently of the
+	 * virtual-memory page size.  OpenBSD's newfs(8) defaults to
+	 * fs_bsize = 16 KiB regardless of the host PAGE_SIZE.
+	 */
+	u32	fs_io_bsize;	/* VFS I/O block size = min(fs_bsize, PAGE_SIZE) */
 
 	/* Filesystem statistics */
 	u64	fs_total_frags;		/* total fragments */
@@ -82,9 +101,16 @@ static inline struct ufs_inode_info *UFS_I(struct inode *inode)
  * ino_fsba(no) = fragment address of the block holding inode no
  * ino_fsbo(no) = index of inode no within that block (0..fs_inopb-1)
  *
- * Block numbers for sb_bread() are in units of fs_bsize (= sb->s_blocksize).
- * Convert a fragment address to a block number with:
- *   block_num = frag_addr / fs_frag
+ * I/O block numbers for sb_bread() are in units of fs_io_bsize.
+ * Convert a fragment address to an I/O block number with:
+ *   io_blk_num = frag_addr / (fs_io_bsize / fs_fsize)
+ *
+ * When fs_io_bsize == fs_bsize (the common case where fs_bsize <= PAGE_SIZE):
+ *   io_blk_num = frag_addr / fs_frag   (same as before)
+ *
+ * When fs_io_bsize == PAGE_SIZE < fs_bsize (large-block FFS):
+ *   io_blk_num = frag_addr * fs_fsize / PAGE_SIZE
+ *   Each FFS block spans (fs_bsize / fs_io_bsize) consecutive I/O blocks.
  */
 static inline u64 ufs_cgbase(struct ufs_sb_info *sbi, u32 cg)
 {
@@ -122,14 +148,15 @@ static inline u32 ufs_ino_to_fsbo(struct ufs_sb_info *sbi, u32 ino)
 }
 
 /*
- * Convert a UFS fragment address to a Linux logical block number.
- * sb->s_blocksize is set to fs_bsize, so:
- *   block_num = frag_addr / fs_frag
+ * Convert a UFS fragment address to a Linux VFS I/O block number.
+ * sb->s_blocksize is set to fs_io_bsize = min(fs_bsize, PAGE_SIZE), so:
+ *   io_block_num = frag_addr / (fs_io_bsize / fs_fsize)
+ *                = frag_addr * fs_fsize / fs_io_bsize
  */
 static inline sector_t ufs_frag_to_blk(struct ufs_sb_info *sbi,
 					u64 frag_addr)
 {
-	return (sector_t)(frag_addr / sbi->fs_frag);
+	return (sector_t)(frag_addr / (sbi->fs_io_bsize / sbi->fs_fsize));
 }
 
 /* ---- Function prototypes ---- */
